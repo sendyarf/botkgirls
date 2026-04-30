@@ -150,10 +150,13 @@ def send_photo(token, chat_id, photo_url, caption):
             if res.status_code == 200:
                 files = {'photo': ('photo.jpg', res.content)}
                 payload = {"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"}
-                r = requests.post(url, data=payload, files=files, timeout=60)
+                r = requests.post(url, data=payload, files=files, timeout=120)
                 if r.json().get("ok"):
                     return True
             logging.warning(f"Attempt {attempt+1} failed to send photo: Status {res.status_code}")
+        except requests.exceptions.ReadTimeout:
+            logging.warning(f"Timeout sending photo. Assuming success to prevent duplicates.")
+            return True
         except Exception as e:
             logging.error(f"Attempt {attempt+1} error sending photo: {e}")
         time.sleep(5)
@@ -193,11 +196,14 @@ def send_gallery(token, chat_id, urls, caption):
                     break # Semua download gagal di chunk ini
 
                 payload = {"chat_id": chat_id, "media": json.dumps(media_group)}
-                r = requests.post(url_api, data=payload, files=files, timeout=120)
+                r = requests.post(url_api, data=payload, files=files, timeout=300)
                 if r.json().get("ok"):
                     break # Sukses kirim chunk ini
                 else:
                     logging.warning(f"Attempt {attempt+1} failed to send gallery chunk: {r.text}")
+            except requests.exceptions.ReadTimeout:
+                logging.warning(f"Timeout sending gallery chunk. Assuming success to prevent duplicates.")
+                break
             except Exception as e:
                 logging.error(f"Attempt {attempt+1} error sending gallery: {e}")
             time.sleep(5)
@@ -248,10 +254,13 @@ def send_video(token, chat_id, video_url, caption, moving_preview_url=None, phot
 
             files = {'video': ('video.mp4', video_data)}
             payload = {"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"}
-            r = requests.post(url, data=payload, files=files, timeout=120)
+            r = requests.post(url, data=payload, files=files, timeout=300)
             if r.json().get("ok"):
                 return True
             logging.warning(f"Attempt {attempt+1} failed to upload video to Telegram")
+        except requests.exceptions.ReadTimeout:
+            logging.warning(f"Timeout sending video. Assuming success to prevent duplicates.")
+            return True
         except Exception as e:
             logging.error(f"Attempt {attempt+1} error sending video: {e}")
         time.sleep(5)
