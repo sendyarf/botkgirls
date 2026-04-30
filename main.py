@@ -88,7 +88,8 @@ def load_history():
         "new": [],
         "top": [],
         "rising": [],
-        "media": []
+        "media": [],
+        "ads": []
     }
     if os.path.exists(HISTORY_FILE):
         try:
@@ -138,11 +139,12 @@ def send_message(token, chat_id, text):
 
 
 def send_photo(token, chat_id, photo_url, caption):
+    """Kirim foto ke Telegram."""
     if not chat_id or chat_id.startswith("YOUR_"):
-        return
+        return False
     url = f"https://api.telegram.org/bot{token}/sendPhoto"
 
-    for attempt in range(3):  # Coba hingga 3 kali
+    for attempt in range(3):
         try:
             res = requests.get(photo_url, headers={"User-Agent": USER_AGENT}, timeout=30)
             if res.status_code == 200:
@@ -150,49 +152,96 @@ def send_photo(token, chat_id, photo_url, caption):
                 payload = {"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"}
                 r = requests.post(url, data=payload, files=files, timeout=60)
                 if r.json().get("ok"):
-                    return
+                    return True
             logging.warning(f"Attempt {attempt+1} failed to send photo: Status {res.status_code}")
         except Exception as e:
             logging.error(f"Attempt {attempt+1} error sending photo: {e}")
         time.sleep(5)
 
+    logging.error(f"All attempts failed to send photo: {photo_url}")
+    return False
+
+
+def send_gallery(token, chat_id, urls, caption):
+    """Kirim album/galeri ke Telegram (dipecah per 10 media)."""
+    if not chat_id or chat_id.startswith("YOUR_"):
+        return False
+    url_api = f"https://api.telegram.org/bot{token}/sendMediaGroup"
+
+    # Split URLs into chunks of 10
+    chunks = [urls[i:i + 10] for i in range(0, len(urls), 10)]
+    
+    overall_success = True
+    for chunk_idx, chunk_urls in enumerate(chunks):
+        for attempt in range(3):
+            try:
+                files = {}
+                media_group = []
+                for i, img_url in enumerate(chunk_urls):
+                    res = requests.get(img_url, headers={"User-Agent": USER_AGENT}, timeout=30)
+                    if res.status_code == 200:
+                        file_key = f'photo_{chunk_idx}_{i}'
+                        files[file_key] = (f'{file_key}.jpg', res.content)
+                        media_item = {"type": "photo", "media": f"attach://{file_key}"}
+                        # Pasang caption hanya di foto pertama pada chunk pertama
+                        if i == 0 and chunk_idx == 0:
+                            media_item["caption"] = caption
+                            media_item["parse_mode"] = "HTML"
+                        media_group.append(media_item)
+                
+                if not media_group:
+                    break # Semua download gagal di chunk ini
+
+                payload = {"chat_id": chat_id, "media": json.dumps(media_group)}
+                r = requests.post(url_api, data=payload, files=files, timeout=120)
+                if r.json().get("ok"):
+                    break # Sukses kirim chunk ini
+                else:
+                    logging.warning(f"Attempt {attempt+1} failed to send gallery chunk: {r.text}")
+            except Exception as e:
+                logging.error(f"Attempt {attempt+1} error sending gallery: {e}")
+            time.sleep(5)
+        else:
+            overall_success = False
+            
+        time.sleep(3) # Jeda agar tidak terkena limit rate Telegram
+    return overall_success
+
 
 def send_video(token, chat_id, video_url, caption, moving_preview_url=None, photo_preview_url=None):
+    """Kirim video ke Telegram."""
     if not chat_id or chat_id.startswith("YOUR_"):
-        return
+        return False
     url = f"https://api.telegram.org/bot{token}/sendVideo"
 
-    for attempt in range(3):  # Coba hingga 3 kali
+    for attempt in range(3):
         try:
-            # Stream download: check Content-Length first to avoid buffering huge files
             with requests.get(video_url, headers={"User-Agent": USER_AGENT}, timeout=60, stream=True) as res:
                 if res.status_code != 200:
                     logging.warning(f"Attempt {attempt+1} failed to fetch video: Status {res.status_code}")
                     time.sleep(5)
                     continue
 
-                # Check Content-Length header if available
                 content_length = res.headers.get("Content-Length")
                 if content_length and int(content_length) > MAX_VIDEO_SIZE:
                     logging.warning(f"Video too large ({content_length} bytes). Trying moving preview.")
                     if moving_preview_url and moving_preview_url != video_url:
-                        send_video(token, chat_id, moving_preview_url, caption)
+                        return send_video(token, chat_id, moving_preview_url, caption)
                     elif photo_preview_url:
-                        send_photo(token, chat_id, photo_preview_url, caption)
-                    return
+                        return send_photo(token, chat_id, photo_preview_url, caption)
+                    return False
 
-                # Download in chunks with size limit
                 chunks = []
                 downloaded = 0
-                for chunk in res.iter_content(chunk_size=1024 * 1024):  # 1MB chunks
+                for chunk in res.iter_content(chunk_size=1024 * 1024):
                     downloaded += len(chunk)
                     if downloaded > MAX_VIDEO_SIZE:
                         logging.warning(f"Video exceeded {MAX_VIDEO_SIZE} bytes during download. Trying moving preview.")
                         if moving_preview_url and moving_preview_url != video_url:
-                            send_video(token, chat_id, moving_preview_url, caption)
+                            return send_video(token, chat_id, moving_preview_url, caption)
                         elif photo_preview_url:
-                            send_photo(token, chat_id, photo_preview_url, caption)
-                        return
+                            return send_photo(token, chat_id, photo_preview_url, caption)
+                        return False
                     chunks.append(chunk)
 
                 video_data = b"".join(chunks)
@@ -201,11 +250,14 @@ def send_video(token, chat_id, video_url, caption, moving_preview_url=None, phot
             payload = {"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"}
             r = requests.post(url, data=payload, files=files, timeout=120)
             if r.json().get("ok"):
-                return
+                return True
             logging.warning(f"Attempt {attempt+1} failed to upload video to Telegram")
         except Exception as e:
             logging.error(f"Attempt {attempt+1} error sending video: {e}")
         time.sleep(5)
+
+    logging.error(f"All attempts failed to send video: {video_url}")
+    return False
 
 
 def get_media_type_and_url(post):
@@ -254,22 +306,26 @@ def get_media_type_and_url(post):
         return "video", url, moving_preview, photo_preview
     elif url.endswith(('.jpg', '.jpeg', '.png')):
         return "photo", url.replace('&amp;', '&'), moving_preview, photo_preview
+    
+    # Deteksi Gallery (Album Reddit)
     elif 'gallery_data' in data and 'media_metadata' in data:
         try:
-            first_item_id = data['gallery_data']['items'][0]['media_id']
-            img_url = data['media_metadata'][first_item_id]['s']['u']
-            return "photo", img_url.replace('&amp;', '&'), moving_preview, photo_preview
+            urls = []
+            for item in data['gallery_data']['items']:
+                media_id = item['media_id']
+                img_url = data['media_metadata'][media_id]['s']['u']
+                urls.append(img_url.replace('&amp;', '&'))
+            if len(urls) > 1:
+                return "gallery", urls, moving_preview, photo_preview
+            elif len(urls) == 1:
+                return "photo", urls[0], moving_preview, photo_preview
         except:
             return "photo", url, moving_preview, photo_preview
+    
     elif data.get('is_gallery'):
         return "photo", url, moving_preview, photo_preview
     else:
         return "link", url, moving_preview, photo_preview
-
-
-def _is_in_any_feed_history(history, post_id):
-    """Check if a post ID exists in any of the feed histories."""
-    return any(post_id in history[feed] for feed in FEED_TYPES)
 
 
 def process_feed(history, feed_type):
@@ -307,9 +363,19 @@ def process_feed(history, feed_type):
             continue
 
         # AI Filter
-        if not _is_in_any_feed_history(history, post_id):
-            if check_is_ad_with_ai(title):
+        if post_id not in history[feed_type]:
+            if post_id not in history["ads"]:
+                if check_is_ad_with_ai(title):
+                    history["ads"].append(post_id)
+                    if len(history["ads"]) > 500:
+                        history["ads"] = history["ads"][-500:]
+                    history[feed_type].append(post_id)
+                    save_history(history)
+                    continue
+            else:
+                logging.info(f"Skipping known ad in {feed_type}: {post_id}")
                 history[feed_type].append(post_id)
+                save_history(history)
                 continue
 
         media_type, media_url, moving_preview, photo_preview = get_media_type_and_url(post)
@@ -319,7 +385,6 @@ def process_feed(history, feed_type):
         caption = f"<b>{title}</b>"
 
         # 1. Kirim ke channel feed (hot, new, top, atau rising)
-        # Sesuai JSON aslinya, tanpa peduli channel lain
         if post_id not in history[feed_type]:
             logging.info(f"New post found in {feed_type}: {post_id}")
             chat_id = channels.get(feed_type)
@@ -328,31 +393,40 @@ def process_feed(history, feed_type):
                     send_photo(token, chat_id, media_url, caption)
                 elif media_type == "video":
                     send_video(token, chat_id, media_url, caption, moving_preview, photo_preview)
+                elif media_type == "gallery":
+                    send_gallery(token, chat_id, media_url, caption)
                 else:
                     send_message(token, chat_id, f"{caption}\n{media_url}")
                 time.sleep(2)
-            
-            # Masukkan ke history feed ini
+
+            # [FIX ANTI-DUPLIKAT] Fire and Forget: 
+            # Selalu catat ID ke history meskipun API Telegram error/timeout.
+            # Ini memastikan bot tidak pernah terjebak dalam loop mengirim foto/ID yang sama.
             history[feed_type].append(post_id)
             if len(history[feed_type]) > 200:
                 history[feed_type] = history[feed_type][-200:]
+            save_history(history)
 
-        # 2. Kirim ke channel kpop5 (Photo) & kpop6 (Video) 
-        # HANYA JIKA SUMBERNYA DARI FEED 'NEW'
+        # 2. Kirim ke channel kpop5 (Photo) & kpop6 (Video)
         if feed_type == "new" and post_id not in history["media"]:
             if media_type == "photo" and channels.get("photo"):
                 logging.info(f"Routing new photo to kpop5: {post_id}")
                 send_photo(token, channels["photo"], media_url, caption)
-                history["media"].append(post_id)
+                time.sleep(2)
+            elif media_type == "gallery" and channels.get("photo"):
+                logging.info(f"Routing new gallery to kpop5: {post_id}")
+                send_gallery(token, channels["photo"], media_url, caption)
                 time.sleep(2)
             elif media_type == "video" and channels.get("video"):
                 logging.info(f"Routing new video to kpop6: {post_id}")
                 send_video(token, channels["video"], media_url, caption, moving_preview, photo_preview)
-                history["media"].append(post_id)
                 time.sleep(2)
 
+            # [FIX ANTI-DUPLIKAT] Fire and Forget untuk history media
+            history["media"].append(post_id)
             if len(history["media"]) > 1000:
                 history["media"] = history["media"][-1000:]
+            save_history(history)
 
 
 def main():
