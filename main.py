@@ -157,7 +157,7 @@ def send_photo(token, chat_id, photo_url, caption):
         time.sleep(5)
 
 
-def send_video(token, chat_id, video_url, caption, preview_url=None):
+def send_video(token, chat_id, video_url, caption, moving_preview_url=None, photo_preview_url=None):
     if not chat_id or chat_id.startswith("YOUR_"):
         return
     url = f"https://api.telegram.org/bot{token}/sendVideo"
@@ -174,9 +174,12 @@ def send_video(token, chat_id, video_url, caption, preview_url=None):
                 # Check Content-Length header if available
                 content_length = res.headers.get("Content-Length")
                 if content_length and int(content_length) > MAX_VIDEO_SIZE:
-                    logging.warning(f"Video too large ({content_length} bytes via header). Sending preview instead.")
-                    if preview_url:
-                        send_photo(token, chat_id, preview_url, caption)
+                    logging.warning(f"Video too large ({content_length} bytes). Trying moving preview.")
+                    if moving_preview_url and moving_preview_url != video_url:
+                        # Try to send the smaller moving preview instead
+                        send_video(token, chat_id, moving_preview_url, caption)
+                    elif photo_preview_url:
+                        send_photo(token, chat_id, photo_preview_url, caption)
                     return
 
                 # Download in chunks with size limit
@@ -185,9 +188,11 @@ def send_video(token, chat_id, video_url, caption, preview_url=None):
                 for chunk in res.iter_content(chunk_size=1024 * 1024):  # 1MB chunks
                     downloaded += len(chunk)
                     if downloaded > MAX_VIDEO_SIZE:
-                        logging.warning(f"Video exceeded {MAX_VIDEO_SIZE} bytes during download. Sending preview.")
-                        if preview_url:
-                            send_photo(token, chat_id, preview_url, caption)
+                        logging.warning(f"Video exceeded {MAX_VIDEO_SIZE} bytes during download. Trying moving preview.")
+                        if moving_preview_url and moving_preview_url != video_url:
+                            send_video(token, chat_id, moving_preview_url, caption)
+                        elif photo_preview_url:
+                            send_photo(token, chat_id, photo_preview_url, caption)
                         return
                     chunks.append(chunk)
 
@@ -210,55 +215,62 @@ def get_media_type_and_url(post):
     domain = data.get('domain', '')
     is_video = data.get('is_video', False)
 
-    # Ambil preview image URL jika ada (untuk fallback video > 50MB)
-    preview_url = ""
+    # 1. Ambil photo preview URL (diam)
+    photo_preview = ""
     try:
-        preview_url = data.get('preview', {}).get('images', [{}])[0].get('source', {}).get('url', '')
-        preview_url = preview_url.replace('&amp;', '&')
-    except Exception as e:
-        logging.debug(f"Could not get preview URL: {e}")
-        preview_url = data.get('thumbnail', '')
+        photo_preview = data.get('preview', {}).get('images', [{}])[0].get('source', {}).get('url', '')
+        photo_preview = photo_preview.replace('&amp;', '&')
+    except:
+        photo_preview = data.get('thumbnail', '')
 
-    # Check for direct mp4 preview (very common for redgifs and gfycat on Reddit)
-    preview_vid = data.get('preview', {}).get('reddit_video_preview', {}).get('fallback_url')
+    # 2. Ambil moving preview URL (media bergerak resolusi rendah/gif)
+    moving_preview = ""
+    try:
+        # Coba ambil mp4 variant dari preview (biasanya lebih kecil dari main video)
+        variants = data.get('preview', {}).get('images', [{}])[0].get('variants', {})
+        moving_preview = variants.get('mp4', {}).get('source', {}).get('url', '')
+        if not moving_preview:
+            moving_preview = variants.get('gif', {}).get('source', {}).get('url', '')
+        
+        # Coba ambil reddit_video_preview
+        if not moving_preview:
+            moving_preview = data.get('preview', {}).get('reddit_video_preview', {}).get('fallback_url', '')
+            
+        moving_preview = moving_preview.replace('&amp;', '&')
+    except:
+        pass
 
+    # Logika deteksi media utama
     if domain == 'redgifs.com':
         try:
             thumb = data.get('secure_media', {}).get('oembed', {}).get('thumbnail_url', '')
             if '-poster.jpg' in thumb:
                 direct_mp4 = thumb.replace('-poster.jpg', '.mp4')
-                return "video", direct_mp4, preview_url
-        except Exception as e:
-            logging.debug(f"Redgifs extraction failed: {e}")
+                return "video", direct_mp4, moving_preview, photo_preview
+        except:
+            pass
 
     if is_video:
         try:
             fallback = data['secure_media']['reddit_video']['fallback_url']
-            return "video", fallback, preview_url
-        except (KeyError, TypeError) as e:
-            logging.debug(f"Could not get reddit_video fallback: {e}")
-            return "video", url, preview_url
+            return "video", fallback, moving_preview, photo_preview
+        except:
+            return "video", url, moving_preview, photo_preview
     elif domain in ['redgifs.com', 'gfycat.com'] or url.endswith(('.gif', '.gifv', '.mp4')):
-        if preview_vid:
-            return "video", preview_vid, preview_url
-        return "video", url, preview_url
+        return "video", url, moving_preview, photo_preview
     elif url.endswith(('.jpg', '.jpeg', '.png')):
-        # Bersihkan &amp; jika ada
-        return "photo", url.replace('&amp;', '&'), preview_url
+        return "photo", url.replace('&amp;', '&'), moving_preview, photo_preview
     elif 'gallery_data' in data and 'media_metadata' in data:
         try:
-            # Ambil media_id pertama dari gallery
             first_item_id = data['gallery_data']['items'][0]['media_id']
-            # Ambil URL gambar asli (s = source)
             img_url = data['media_metadata'][first_item_id]['s']['u']
-            return "photo", img_url.replace('&amp;', '&'), preview_url
-        except (KeyError, IndexError, TypeError) as e:
-            logging.debug(f"Gallery extraction failed: {e}")
-            return "photo", url, preview_url
+            return "photo", img_url.replace('&amp;', '&'), moving_preview, photo_preview
+        except:
+            return "photo", url, moving_preview, photo_preview
     elif data.get('is_gallery'):
-        return "photo", url, preview_url
+        return "photo", url, moving_preview, photo_preview
     else:
-        return "link", url, preview_url
+        return "link", url, moving_preview, photo_preview
 
 
 def _is_in_any_feed_history(history, post_id):
@@ -289,7 +301,6 @@ def process_feed(history, feed_type):
 
     posts = data.get('data', {}).get('children', [])
 
-    # Process from oldest to newest in the fetched batch
     for post in reversed(posts):
         if _shutdown_requested:
             return
@@ -298,30 +309,22 @@ def process_feed(history, feed_type):
         post_id = post_data['id']
         title = post_data.get('title', '')
 
-        # Abaikan postingan yang di-pin / pengumuman resmi dari moderator Reddit
         if post_data.get('stickied', False):
-            logging.info(f"Skipping announcement/pinned post: {title}")
             continue
 
-        # Gunakan AI Groq untuk memfilter iklan/pengumuman jika belum ada di history manapun
         if not _is_in_any_feed_history(history, post_id):
             if check_is_ad_with_ai(title):
-                logging.info(f"AI Filtered out (Ad/Announcement): {title}")
-                # Masukkan ke history feed saat ini agar tidak dicek lagi
                 history[feed_type].append(post_id)
                 continue
 
-        permalink = f"https://www.reddit.com{post_data.get('permalink', '')}"
+        media_type, media_url, moving_preview, photo_preview = get_media_type_and_url(post)
 
-        media_type, media_url, preview_url = get_media_type_and_url(post)
-
-        # Abaikan postingan berupa teks (seperti pengumuman subreddit) atau link yang bukan media
         if media_type == "link":
             continue
 
         caption = f"<b>{title}</b>"
 
-        # 1. Send to the specific feed channel (hot, new, top, rising)
+        # 1. Send to the specific feed channel
         if post_id not in history[feed_type]:
             logging.info(f"New post found in {feed_type}: {post_id}")
             chat_id = channels.get(feed_type)
@@ -329,17 +332,16 @@ def process_feed(history, feed_type):
                 if media_type == "photo":
                     send_photo(token, chat_id, media_url, caption)
                 elif media_type == "video":
-                    send_video(token, chat_id, media_url, caption, preview_url)
+                    send_video(token, chat_id, media_url, caption, moving_preview, photo_preview)
                 else:
                     send_message(token, chat_id, f"{caption}\n{media_url}")
-                time.sleep(2)  # Avoid hitting Telegram rate limits
+                time.sleep(2)
 
             history[feed_type].append(post_id)
             if len(history[feed_type]) > 200:
                 history[feed_type] = history[feed_type][-200:]
 
-        # 2. Route to specialized media channels (only photo or only video)
-        # We use a global "media" history to ensure we don't double-post if it appears in both 'hot' and 'new'
+        # 2. Route to specialized media channels
         if post_id not in history["media"]:
             if media_type == "photo" and channels.get("photo"):
                 logging.info(f"Sending photo to photo channel: {post_id}")
@@ -348,7 +350,7 @@ def process_feed(history, feed_type):
                 time.sleep(2)
             elif media_type == "video" and channels.get("video"):
                 logging.info(f"Sending video to video channel: {post_id}")
-                send_video(token, channels["video"], media_url, caption, preview_url)
+                send_video(token, channels["video"], media_url, caption, moving_preview, photo_preview)
                 history["media"].append(post_id)
                 time.sleep(2)
 
@@ -357,7 +359,6 @@ def process_feed(history, feed_type):
 
 
 def main():
-    # Validate required config
     if not BOT_TOKEN:
         logging.error("BOT_TOKEN not set. Please configure .env file.")
         return
@@ -377,13 +378,11 @@ def main():
 
         if not _shutdown_requested:
             logging.info(f"Sleeping for {CHECK_INTERVAL_SECONDS} seconds...")
-            # Sleep in small increments so we can respond to shutdown quickly
             for _ in range(CHECK_INTERVAL_SECONDS):
                 if _shutdown_requested:
                     break
                 time.sleep(1)
 
-    # Final save on shutdown
     save_history(history)
     logging.info("Bot stopped gracefully. History saved.")
 
