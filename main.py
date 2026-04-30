@@ -176,7 +176,6 @@ def send_video(token, chat_id, video_url, caption, moving_preview_url=None, phot
                 if content_length and int(content_length) > MAX_VIDEO_SIZE:
                     logging.warning(f"Video too large ({content_length} bytes). Trying moving preview.")
                     if moving_preview_url and moving_preview_url != video_url:
-                        # Try to send the smaller moving preview instead
                         send_video(token, chat_id, moving_preview_url, caption)
                     elif photo_preview_url:
                         send_photo(token, chat_id, photo_preview_url, caption)
@@ -226,21 +225,16 @@ def get_media_type_and_url(post):
     # 2. Ambil moving preview URL (media bergerak resolusi rendah/gif)
     moving_preview = ""
     try:
-        # Coba ambil mp4 variant dari preview (biasanya lebih kecil dari main video)
         variants = data.get('preview', {}).get('images', [{}])[0].get('variants', {})
         moving_preview = variants.get('mp4', {}).get('source', {}).get('url', '')
         if not moving_preview:
             moving_preview = variants.get('gif', {}).get('source', {}).get('url', '')
-        
-        # Coba ambil reddit_video_preview
         if not moving_preview:
             moving_preview = data.get('preview', {}).get('reddit_video_preview', {}).get('fallback_url', '')
-            
         moving_preview = moving_preview.replace('&amp;', '&')
     except:
         pass
 
-    # Logika deteksi media utama
     if domain == 'redgifs.com':
         try:
             thumb = data.get('secure_media', {}).get('oembed', {}).get('thumbnail_url', '')
@@ -318,15 +312,16 @@ def process_feed(history, feed_type):
                 continue
 
         media_type, media_url, moving_preview, photo_preview = get_media_type_and_url(post)
-
         if media_type == "link":
             continue
 
         caption = f"<b>{title}</b>"
 
-        # 1. Send to the specific feed channel
+        # Kirim ke channel feed DAN channel media khusus secara bersamaan
         if post_id not in history[feed_type]:
             logging.info(f"New post found in {feed_type}: {post_id}")
+            
+            # 1. Kirim ke channel feed (hot, new, top, atau rising)
             chat_id = channels.get(feed_type)
             if chat_id:
                 if media_type == "photo":
@@ -337,25 +332,21 @@ def process_feed(history, feed_type):
                     send_message(token, chat_id, f"{caption}\n{media_url}")
                 time.sleep(2)
 
+            # 2. Kirim ke channel khusus media (photo atau video)
+            # Tanpa filter global history["media"] agar selalu sinkron dengan feed
+            if media_type == "photo" and channels.get("photo"):
+                logging.info(f"Routing photo to photo channel: {post_id}")
+                send_photo(token, channels["photo"], media_url, caption)
+                time.sleep(2)
+            elif media_type == "video" and channels.get("video"):
+                logging.info(f"Routing video to video channel: {post_id}")
+                send_video(token, channels["video"], media_url, caption, moving_preview, photo_preview)
+                time.sleep(2)
+
+            # Masukkan ke history feed ini agar tidak diproses lagi di feed yang sama
             history[feed_type].append(post_id)
             if len(history[feed_type]) > 200:
                 history[feed_type] = history[feed_type][-200:]
-
-        # 2. Route to specialized media channels
-        if post_id not in history["media"]:
-            if media_type == "photo" and channels.get("photo"):
-                logging.info(f"Sending photo to photo channel: {post_id}")
-                send_photo(token, channels["photo"], media_url, caption)
-                history["media"].append(post_id)
-                time.sleep(2)
-            elif media_type == "video" and channels.get("video"):
-                logging.info(f"Sending video to video channel: {post_id}")
-                send_video(token, channels["video"], media_url, caption, moving_preview, photo_preview)
-                history["media"].append(post_id)
-                time.sleep(2)
-
-            if len(history["media"]) > 1000:
-                history["media"] = history["media"][-1000:]
 
 
 def main():
