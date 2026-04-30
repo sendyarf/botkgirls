@@ -5,7 +5,6 @@ import signal
 import tempfile
 import requests
 import logging
-import re
 from dotenv import load_dotenv
 from groq import Groq
 
@@ -154,8 +153,8 @@ def send_photo(token, chat_id, photo_url, caption):
                 if r.json().get("ok"):
                     return True
             logging.warning(f"Attempt {attempt+1} failed to send photo: Status {res.status_code}")
-        except requests.exceptions.ReadTimeout:
-            logging.warning(f"Timeout sending photo. Assuming success to prevent duplicates.")
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+            logging.warning(f"Timeout/connection error sending photo. Assuming success to prevent duplicates.")
             return True
         except Exception as e:
             logging.error(f"Attempt {attempt+1} error sending photo: {e}")
@@ -201,8 +200,8 @@ def send_gallery(token, chat_id, urls, caption):
                     break # Sukses kirim chunk ini
                 else:
                     logging.warning(f"Attempt {attempt+1} failed to send gallery chunk: {r.text}")
-            except requests.exceptions.ReadTimeout:
-                logging.warning(f"Timeout sending gallery chunk. Assuming success to prevent duplicates.")
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+                logging.warning(f"Timeout/connection error sending gallery chunk. Assuming success to prevent duplicates.")
                 break
             except Exception as e:
                 logging.error(f"Attempt {attempt+1} error sending gallery: {e}")
@@ -258,8 +257,8 @@ def send_video(token, chat_id, video_url, caption, moving_preview_url=None, phot
             if r.json().get("ok"):
                 return True
             logging.warning(f"Attempt {attempt+1} failed to upload video to Telegram")
-        except requests.exceptions.ReadTimeout:
-            logging.warning(f"Timeout sending video. Assuming success to prevent duplicates.")
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+            logging.warning(f"Timeout/connection error sending video. Assuming success to prevent duplicates.")
             return True
         except Exception as e:
             logging.error(f"Attempt {attempt+1} error sending video: {e}")
@@ -322,14 +321,18 @@ def get_media_type_and_url(post):
             urls = []
             for item in data['gallery_data']['items']:
                 media_id = item['media_id']
-                img_url = data['media_metadata'][media_id]['s']['u']
-                urls.append(img_url.replace('&amp;', '&'))
+                meta = data['media_metadata'].get(media_id, {})
+                img_url = meta.get('s', {}).get('u', '')
+                if img_url:
+                    urls.append(img_url.replace('&amp;', '&'))
             if len(urls) > 1:
                 return "gallery", urls, moving_preview, photo_preview
             elif len(urls) == 1:
                 return "photo", urls[0], moving_preview, photo_preview
+            else:
+                return "link", url, moving_preview, photo_preview
         except:
-            return "photo", url, moving_preview, photo_preview
+            return "link", url, moving_preview, photo_preview
     
     elif data.get('is_gallery'):
         return "photo", url, moving_preview, photo_preview
