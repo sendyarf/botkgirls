@@ -176,8 +176,7 @@ def send_video(token, chat_id, video_url, caption, preview_url=None):
                 if content_length and int(content_length) > MAX_VIDEO_SIZE:
                     logging.warning(f"Video too large ({content_length} bytes via header). Sending preview instead.")
                     if preview_url:
-                        send_photo(token, chat_id, preview_url,
-                                   f"{caption}\n\n<i>(Video berukuran > 50MB, mengirim preview)</i>")
+                        send_photo(token, chat_id, preview_url, caption)
                     return
 
                 # Download in chunks with size limit
@@ -188,8 +187,7 @@ def send_video(token, chat_id, video_url, caption, preview_url=None):
                     if downloaded > MAX_VIDEO_SIZE:
                         logging.warning(f"Video exceeded {MAX_VIDEO_SIZE} bytes during download. Sending preview.")
                         if preview_url:
-                            send_photo(token, chat_id, preview_url,
-                                       f"{caption}\n\n<i>(Video berukuran > 50MB, mengirim preview)</i>")
+                            send_photo(token, chat_id, preview_url, caption)
                         return
                     chunks.append(chunk)
 
