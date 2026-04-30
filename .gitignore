@@ -1,0 +1,17 @@
+# Secrets
+.env
+config.json
+planAI.txt
+
+# Runtime data
+history.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+venv/
+.venv/
