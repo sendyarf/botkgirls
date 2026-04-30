@@ -4,6 +4,7 @@ config.json
 planAI.txt
 
 # Runtime data
+history.json
 
 # Python
 __pycache__/

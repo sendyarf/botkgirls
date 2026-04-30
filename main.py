@@ -306,6 +306,7 @@ def process_feed(history, feed_type):
         if post_data.get('stickied', False):
             continue
 
+        # AI Filter
         if not _is_in_any_feed_history(history, post_id):
             if check_is_ad_with_ai(title):
                 history[feed_type].append(post_id)
@@ -317,11 +318,10 @@ def process_feed(history, feed_type):
 
         caption = f"<b>{title}</b>"
 
-        # Kirim ke channel feed DAN channel media khusus secara bersamaan
+        # 1. Kirim ke channel feed (hot, new, top, atau rising)
+        # Sesuai JSON aslinya, tanpa peduli channel lain
         if post_id not in history[feed_type]:
             logging.info(f"New post found in {feed_type}: {post_id}")
-            
-            # 1. Kirim ke channel feed (hot, new, top, atau rising)
             chat_id = channels.get(feed_type)
             if chat_id:
                 if media_type == "photo":
@@ -331,22 +331,28 @@ def process_feed(history, feed_type):
                 else:
                     send_message(token, chat_id, f"{caption}\n{media_url}")
                 time.sleep(2)
-
-            # 2. Kirim ke channel khusus media (photo atau video)
-            # Tanpa filter global history["media"] agar selalu sinkron dengan feed
-            if media_type == "photo" and channels.get("photo"):
-                logging.info(f"Routing photo to photo channel: {post_id}")
-                send_photo(token, channels["photo"], media_url, caption)
-                time.sleep(2)
-            elif media_type == "video" and channels.get("video"):
-                logging.info(f"Routing video to video channel: {post_id}")
-                send_video(token, channels["video"], media_url, caption, moving_preview, photo_preview)
-                time.sleep(2)
-
-            # Masukkan ke history feed ini agar tidak diproses lagi di feed yang sama
+            
+            # Masukkan ke history feed ini
             history[feed_type].append(post_id)
             if len(history[feed_type]) > 200:
                 history[feed_type] = history[feed_type][-200:]
+
+        # 2. Kirim ke channel kpop5 (Photo) & kpop6 (Video) 
+        # HANYA JIKA SUMBERNYA DARI FEED 'NEW'
+        if feed_type == "new" and post_id not in history["media"]:
+            if media_type == "photo" and channels.get("photo"):
+                logging.info(f"Routing new photo to kpop5: {post_id}")
+                send_photo(token, channels["photo"], media_url, caption)
+                history["media"].append(post_id)
+                time.sleep(2)
+            elif media_type == "video" and channels.get("video"):
+                logging.info(f"Routing new video to kpop6: {post_id}")
+                send_video(token, channels["video"], media_url, caption, moving_preview, photo_preview)
+                history["media"].append(post_id)
+                time.sleep(2)
+
+            if len(history["media"]) > 1000:
+                history["media"] = history["media"][-1000:]
 
 
 def main():
