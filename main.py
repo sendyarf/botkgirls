@@ -138,87 +138,97 @@ def send_message(token, chat_id, text):
 
 
 def send_photo(token, chat_id, photo_url, caption):
-    """Kirim foto ke Telegram."""
+    """Kirim foto ke Telegram. Download dengan retry, Upload tanpa retry."""
     if not chat_id or chat_id.startswith("YOUR_"):
         return False
     url = f"https://api.telegram.org/bot{token}/sendPhoto"
 
+    # 1. DOWNLOAD (Boleh retry)
+    photo_data = None
     for attempt in range(3):
         try:
             res = requests.get(photo_url, headers={"User-Agent": USER_AGENT}, timeout=30)
             if res.status_code == 200:
-                files = {'photo': ('photo.jpg', res.content)}
-                payload = {"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"}
-                r = requests.post(url, data=payload, files=files, timeout=120)
-                if r.json().get("ok"):
-                    return True
-            logging.warning(f"Attempt {attempt+1} failed to send photo: Status {res.status_code}")
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
-            logging.warning(f"Timeout/connection error sending photo. Assuming success to prevent duplicates.")
-            return True
+                photo_data = res.content
+                break
+            logging.warning(f"Attempt {attempt+1} failed to fetch photo: Status {res.status_code}")
         except Exception as e:
-            logging.error(f"Attempt {attempt+1} error sending photo: {e}")
+            logging.error(f"Attempt {attempt+1} error downloading photo: {e}")
         time.sleep(5)
 
-    logging.error(f"All attempts failed to send photo: {photo_url}")
-    return False
+    if not photo_data:
+        logging.error(f"Failed to download photo after 3 attempts: {photo_url}")
+        return False
+
+    # 2. UPLOAD (Tanpa retry)
+    try:
+        files = {'photo': ('photo.jpg', photo_data)}
+        payload = {"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"}
+        r = requests.post(url, data=payload, files=files, timeout=120)
+        if not (r.status_code == 200 and r.json().get("ok")):
+            logging.warning(f"Telegram returned non-ok for photo, assuming success. Response: {r.text[:200]}")
+    except Exception as e:
+        logging.error(f"Error uploading photo to Telegram, assuming success: {e}")
+    return True
 
 
 def send_gallery(token, chat_id, urls, caption):
-    """Kirim album/galeri ke Telegram (dipecah per 10 media)."""
+    """Kirim album ke Telegram. Download dengan retry, Upload tanpa retry per chunk."""
     if not chat_id or chat_id.startswith("YOUR_"):
         return False
     url_api = f"https://api.telegram.org/bot{token}/sendMediaGroup"
 
-    # Split URLs into chunks of 10
     chunks = [urls[i:i + 10] for i in range(0, len(urls), 10)]
     
-    overall_success = True
     for chunk_idx, chunk_urls in enumerate(chunks):
-        for attempt in range(3):
-            try:
-                files = {}
-                media_group = []
-                for i, img_url in enumerate(chunk_urls):
+        # 1. DOWNLOAD CHUNK (Boleh retry per gambar)
+        files = {}
+        media_group = []
+        for i, img_url in enumerate(chunk_urls):
+            photo_data = None
+            for attempt in range(3):
+                try:
                     res = requests.get(img_url, headers={"User-Agent": USER_AGENT}, timeout=30)
                     if res.status_code == 200:
-                        file_key = f'photo_{chunk_idx}_{i}'
-                        files[file_key] = (f'{file_key}.jpg', res.content)
-                        media_item = {"type": "photo", "media": f"attach://{file_key}"}
-                        # Pasang caption hanya di foto pertama pada chunk pertama
-                        if i == 0 and chunk_idx == 0:
-                            media_item["caption"] = caption
-                            media_item["parse_mode"] = "HTML"
-                        media_group.append(media_item)
+                        photo_data = res.content
+                        break
+                except Exception as e:
+                    logging.error(f"Attempt {attempt+1} error downloading gallery img: {e}")
+                time.sleep(2)
                 
-                if not media_group:
-                    break # Semua download gagal di chunk ini
+            if photo_data:
+                file_key = f'photo_{chunk_idx}_{i}'
+                files[file_key] = (f'{file_key}.jpg', photo_data)
+                media_item = {"type": "photo", "media": f"attach://{file_key}"}
+                if i == 0 and chunk_idx == 0:
+                    media_item["caption"] = caption
+                    media_item["parse_mode"] = "HTML"
+                media_group.append(media_item)
+                
+        if not media_group:
+            continue
 
-                payload = {"chat_id": chat_id, "media": json.dumps(media_group)}
-                r = requests.post(url_api, data=payload, files=files, timeout=300)
-                if r.json().get("ok"):
-                    break # Sukses kirim chunk ini
-                else:
-                    logging.warning(f"Attempt {attempt+1} failed to send gallery chunk: {r.text}")
-            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
-                logging.warning(f"Timeout/connection error sending gallery chunk. Assuming success to prevent duplicates.")
-                break
-            except Exception as e:
-                logging.error(f"Attempt {attempt+1} error sending gallery: {e}")
-            time.sleep(5)
-        else:
-            overall_success = False
+        # 2. UPLOAD CHUNK (Tanpa retry)
+        try:
+            payload = {"chat_id": chat_id, "media": json.dumps(media_group)}
+            r = requests.post(url_api, data=payload, files=files, timeout=300)
+            if not (r.status_code == 200 and r.json().get("ok")):
+                logging.warning(f"Telegram returned non-ok for gallery chunk. Response: {r.text[:200]}")
+        except Exception as e:
+            logging.error(f"Error uploading gallery chunk: {e}")
             
-        time.sleep(3) # Jeda agar tidak terkena limit rate Telegram
-    return overall_success
+        time.sleep(3)
+    return True
 
 
 def send_video(token, chat_id, video_url, caption, moving_preview_url=None, photo_preview_url=None):
-    """Kirim video ke Telegram."""
+    """Kirim video ke Telegram. Download dengan retry, Upload tanpa retry."""
     if not chat_id or chat_id.startswith("YOUR_"):
         return False
     url = f"https://api.telegram.org/bot{token}/sendVideo"
 
+    # 1. DOWNLOAD (Boleh retry)
+    video_data = None
     for attempt in range(3):
         try:
             with requests.get(video_url, headers={"User-Agent": USER_AGENT}, timeout=60, stream=True) as res:
@@ -241,7 +251,7 @@ def send_video(token, chat_id, video_url, caption, moving_preview_url=None, phot
                 for chunk in res.iter_content(chunk_size=1024 * 1024):
                     downloaded += len(chunk)
                     if downloaded > MAX_VIDEO_SIZE:
-                        logging.warning(f"Video exceeded {MAX_VIDEO_SIZE} bytes during download. Trying moving preview.")
+                        logging.warning(f"Video exceeded limit during download. Trying preview.")
                         if moving_preview_url and moving_preview_url != video_url:
                             return send_video(token, chat_id, moving_preview_url, caption)
                         elif photo_preview_url:
@@ -250,22 +260,26 @@ def send_video(token, chat_id, video_url, caption, moving_preview_url=None, phot
                     chunks.append(chunk)
 
                 video_data = b"".join(chunks)
-
-            files = {'video': ('video.mp4', video_data)}
-            payload = {"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"}
-            r = requests.post(url, data=payload, files=files, timeout=300)
-            if r.json().get("ok"):
-                return True
-            logging.warning(f"Attempt {attempt+1} failed to upload video to Telegram")
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
-            logging.warning(f"Timeout/connection error sending video. Assuming success to prevent duplicates.")
-            return True
+                break
         except Exception as e:
-            logging.error(f"Attempt {attempt+1} error sending video: {e}")
-        time.sleep(5)
+            logging.error(f"Attempt {attempt+1} error downloading video: {e}")
+            time.sleep(5)
 
-    logging.error(f"All attempts failed to send video: {video_url}")
-    return False
+    if not video_data:
+        logging.error(f"Failed to download video after 3 attempts: {video_url}")
+        return False
+
+    # 2. UPLOAD (Tanpa retry)
+    try:
+        files = {'video': ('video.mp4', video_data)}
+        payload = {"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"}
+        r = requests.post(url, data=payload, files=files, timeout=300)
+        if not (r.status_code == 200 and r.json().get("ok")):
+            logging.warning(f"Telegram returned non-ok for video. Assuming success. Response: {r.text[:200]}")
+    except Exception as e:
+        logging.error(f"Error uploading video to Telegram, assuming success: {e}")
+    
+    return True
 
 
 def get_media_type_and_url(post):
