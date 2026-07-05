@@ -2,44 +2,84 @@ import os
 import time
 import json
 import signal
-import tempfile
-import requests
+import sys
+import sqlite3
 import logging
+from urllib3.util.retry import Retry
+from requests.adapters import HTTPAdapter
+import requests
 from dotenv import load_dotenv
 from groq import Groq
+import asyncio
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
+from pyrogram import Client
 
-# Load environment variables from .env file
 load_dotenv()
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+PID = os.getpid()
+logging.basicConfig(level=logging.INFO, format=f'%(asctime)s - PID:{PID} - %(levelname)s - %(message)s')
 
 # ================= CONFIGURATION =================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 SUBREDDIT = os.getenv("SUBREDDIT", "kpopfap")
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "300"))
+API_ID = int(os.getenv("API_ID", "0"))
+API_HASH = os.getenv("API_HASH", "")
+PHONE_NUMBER = os.getenv("PHONE_NUMBER", "")
+
 
 CHANNELS = {
-    "hot": "-1003981379214",     # kpop1 (Semua media dari Hot)
-    "new": "-1003944214147",     # kpop2 (Semua media dari New)
-    "top": "-1003932396172",     # kpop3 (Semua media dari Top)
-    "rising": "-1003947731924",  # kpop4 (Semua media dari Rising)
-    "photo": "-1003932976389",   # kpop5 (Hanya Foto)
-    "video": "-1003896668440"    # kpop6 (Hanya Video/GIF)
+    "hot": ["-1003981379214", "-1001958598110"],
+    "new": "-1003944214147",
+    "top": "-1003932396172",
+    "rising": "-1003947731924",
+    "photo": "-1003932976389",
+    "video": "-1003896668440"
 }
+
+
+def _get_chat_ids(channels, key):
+    """Retrieve a list of chat IDs for a given key from the channels dictionary."""
+    val = channels.get(key)
+    if not val:
+        return []
+    if isinstance(val, list):
+        return [str(v).strip() for v in val if v]
+    if isinstance(val, str):
+        return [v.strip() for v in val.split(",") if v.strip()]
+    return [str(val)]
 # =================================================
 
-HISTORY_FILE = "history.json"
+DATABASE_FILE = "history.db"
+HISTORY_CLEANUP_DAYS = 7
 USER_AGENT = "KpopTelegramBot/1.0"
 FEED_TYPES = ["hot", "new", "top", "rising"]
-MAX_VIDEO_SIZE = 50 * 1024 * 1024  # 50MB Telegram Bot API limit
+MAX_VIDEO_SIZE = 50 * 1024 * 1024
 
-# Graceful shutdown flag
+# Reusable session with connection pooling to prevent WinError 10013 (port exhaustion)
+_http = requests.Session()
+_adapter = HTTPAdapter(
+    pool_connections=20,
+    pool_maxsize=20,
+    max_retries=Retry(total=2, backoff_factor=1, status_forcelist=[429, 502, 503, 504])
+)
+_http.mount("https://", _adapter)
+_http.mount("http://", _adapter)
+_http.headers.update({"User-Agent": USER_AGENT})
+
+# Groq client instance (reuse, jangan new per AI check)
+_groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+
 _shutdown_requested = False
+_db_conn = None
+_send_counts = {}  # diagnostic: tracks sends per post_id within this process
 
 
 def _signal_handler(signum, frame):
-    """Handle shutdown signals gracefully."""
     global _shutdown_requested
     logging.info(f"Received signal {signum}, shutting down gracefully...")
     _shutdown_requested = True
@@ -48,15 +88,224 @@ def _signal_handler(signum, frame):
 signal.signal(signal.SIGINT, _signal_handler)
 signal.signal(signal.SIGTERM, _signal_handler)
 
+PID_FILE = "bot.pid"
 
-def check_is_ad_with_ai(title):
-    """Menggunakan Groq AI untuk mengecek apakah judul postingan adalah iklan atau pengumuman."""
-    if not GROQ_API_KEY:
-        return False
+
+def _acquire_pid_lock():
+    """Acquire a PID-based lock to prevent multiple bot instances from running.
+    Returns True if this is the only instance, False if another instance is already running."""
+    if os.path.exists(PID_FILE):
+        old_pid = None
+        try:
+            with open(PID_FILE, "r") as f:
+                old_pid = int(f.read().strip())
+            # Check if the old process is still running
+            os.kill(old_pid, 0)  # signal 0 = no-op, but raises OSError if process doesn't exist
+            # If we reach here, old process is still alive
+            logging.error(
+                f"Another bot instance is already running (PID {old_pid}). "
+                f"Remove {PID_FILE} if the old instance has crashed."
+            )
+            return False
+        except (ValueError, OSError):
+            # Old PID file exists but process is dead or file is corrupted
+            if old_pid is not None:
+                logging.warning(f"Removing stale PID lock from dead process (PID {old_pid})")
+            else:
+                logging.warning(f"Removing corrupted/unreadable PID lock file: {PID_FILE}")
+            try:
+                os.remove(PID_FILE)
+            except OSError:
+                pass
 
     try:
-        client = Groq(api_key=GROQ_API_KEY)
-        chat_completion = client.chat.completions.create(
+        with open(PID_FILE, "w") as f:
+            f.write(str(PID))
+        return True
+    except OSError as e:
+        logging.error(f"Failed to create PID lock file: {e}")
+        return False
+
+
+def _release_pid_lock():
+    """Remove the PID lock file on shutdown."""
+    try:
+        if os.path.exists(PID_FILE):
+            with open(PID_FILE, "r") as f:
+                lock_pid = int(f.read().strip())
+            if lock_pid == PID:
+                os.remove(PID_FILE)
+                logging.info("PID lock released.")
+    except (OSError, ValueError):
+        pass
+
+
+# ================= DATABASE =================
+
+def init_db(db_path=DATABASE_FILE):
+    global _db_conn
+    _db_conn = sqlite3.connect(db_path)
+    _db_conn.execute("PRAGMA journal_mode=WAL")
+    _db_conn.execute("PRAGMA synchronous=NORMAL")
+    _db_conn.execute("""
+        CREATE TABLE IF NOT EXISTS processed_posts (
+            post_id TEXT NOT NULL,
+            feed_type TEXT NOT NULL,
+            is_ad INTEGER DEFAULT 0,
+            media_url TEXT,
+            processed_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (post_id, feed_type)
+        )
+    """)
+    # Migration: add media_url column for older DBs that lack it
+    try:
+        _db_conn.execute("ALTER TABLE processed_posts ADD COLUMN media_url TEXT")
+    except sqlite3.OperationalError:
+        pass  # column already exists (SQLite doesn't support IF NOT EXISTS for ALTER)
+    _db_conn.execute("CREATE INDEX IF NOT EXISTS idx_feed_type ON processed_posts(feed_type)")
+    _db_conn.execute("CREATE INDEX IF NOT EXISTS idx_processed_at ON processed_posts(processed_at)")
+    _db_conn.execute("CREATE INDEX IF NOT EXISTS idx_media_url_feed ON processed_posts(media_url, feed_type)")
+    _db_conn.commit()
+
+    if os.path.exists("history.json"):
+        _migrate_from_json()
+        try:
+            os.rename("history.json", "history.json.bak")
+        except OSError:
+            pass
+
+    return _db_conn
+
+
+def _migrate_from_json():
+    try:
+        with open("history.json", "r") as f:
+            old = json.load(f)
+    except Exception as e:
+        logging.error(f"Failed to read history.json for migration: {e}")
+        return
+
+    migrated = 0
+    try:
+        for feed in FEED_TYPES:
+            for pid in old.get(feed, []):
+                _db_conn.execute(
+                    "INSERT OR IGNORE INTO processed_posts(post_id, feed_type) VALUES(?, ?)",
+                    (pid, feed)
+                )
+                migrated += 1
+
+        for pid in old.get("media", []):
+            _db_conn.execute(
+                "INSERT OR IGNORE INTO processed_posts(post_id, feed_type) VALUES(?, 'media')",
+                (pid,)
+            )
+            migrated += 1
+
+        for pid in old.get("ads", []):
+            _db_conn.execute(
+                "INSERT OR IGNORE INTO processed_posts(post_id, feed_type, is_ad) VALUES(?, 'ad', 1)",
+                (pid,)
+            )
+            migrated += 1
+
+        _db_conn.commit()
+        logging.info(f"Migrated {migrated} entries from history.json to SQLite")
+    except Exception as e:
+        logging.error(f"Migration failed: {e}")
+        _db_conn.rollback()
+
+
+def is_processed(post_id, feed_type):
+    try:
+        row = _db_conn.execute(
+            "SELECT 1 FROM processed_posts WHERE post_id = ? AND feed_type = ?",
+            (post_id, feed_type)
+        ).fetchone()
+        return row is not None
+    except sqlite3.Error as e:
+        logging.error(f"DB error in is_processed({post_id}, {feed_type}): {e}")
+        return False
+
+
+def is_known_ad(post_id):
+    try:
+        row = _db_conn.execute(
+            "SELECT 1 FROM processed_posts WHERE post_id = ? AND feed_type = 'ad'",
+            (post_id,)
+        ).fetchone()
+        return row is not None
+    except sqlite3.Error as e:
+        logging.error(f"DB error in is_known_ad({post_id}): {e}")
+        return False
+
+
+def is_media_url_processed(media_url, feed_type):
+    """Check if a media URL has already been posted in the given feed_type (crosspost dedup)."""
+    if not media_url or (isinstance(media_url, list) and not media_url):
+        return False
+    try:
+        # For galleries, check the first image URL as representative
+        check_url = media_url[0] if isinstance(media_url, list) else media_url
+        row = _db_conn.execute(
+            "SELECT 1 FROM processed_posts WHERE media_url = ? AND feed_type = ? AND media_url IS NOT NULL",
+            (check_url, feed_type)
+        ).fetchone()
+        return row is not None
+    except sqlite3.Error as e:
+        logging.error(f"DB error in is_media_url_processed({feed_type}): {e}")
+        return False
+
+
+def mark_processed(post_id, feed_type, is_ad=False, also_mark_ad=False, media_url=None):
+    url = ((media_url[0] if isinstance(media_url, list) else media_url) if media_url else None)
+    _db_conn.execute(
+        "INSERT OR REPLACE INTO processed_posts(post_id, feed_type, is_ad, media_url, processed_at) VALUES(?, ?, ?, ?, datetime('now'))",
+        (post_id, feed_type, 1 if is_ad else 0, url)
+    )
+    if also_mark_ad:
+        _db_conn.execute(
+            "INSERT OR REPLACE INTO processed_posts(post_id, feed_type, is_ad, processed_at) VALUES(?, 'ad', 1, datetime('now'))",
+            (post_id,)
+        )
+    _db_conn.commit()
+
+
+def track_send(post_id, feed_type, channel_name):
+    """Diagnostic: track and log sends per post to detect duplicates."""
+    key = f"{post_id}@{feed_type}"
+    count = _send_counts.get(key, 0)
+    _send_counts[key] = count + 1
+    if count > 0:
+        logging.warning(
+            f"DUPLICATE SEND DETECTED: post={post_id}, feed={feed_type}, "
+            f"channel={channel_name}, send_number={count + 1} within this process!"
+        )
+
+
+def cleanup_old_entries(days=HISTORY_CLEANUP_DAYS):
+    cur = _db_conn.execute(
+        "DELETE FROM processed_posts WHERE processed_at < datetime('now', ?)",
+        (f'-{days} days',)
+    )
+    if cur.rowcount > 0:
+        logging.info(f"Cleaned up {cur.rowcount} old history entries (> {days} days)")
+    _db_conn.commit()
+
+
+def get_stats():
+    """Return row counts for monitoring."""
+    row = _db_conn.execute("SELECT feed_type, COUNT(*) FROM processed_posts GROUP BY feed_type").fetchall()
+    return {r[0]: r[1] for r in row}
+
+
+# ================= AI FILTER =================
+
+def check_is_ad_with_ai(title):
+    if not _groq_client:
+        return False
+    try:
+        chat_completion = _groq_client.chat.completions.create(
             messages=[
                 {
                     "role": "system",
@@ -73,7 +322,6 @@ def check_is_ad_with_ai(title):
         is_ad = "YES" in answer
         if is_ad:
             logging.info(f"AI detected ad/announcement: {title}")
-        # Simple rate limiting for Groq free tier
         time.sleep(1)
         return is_ad
     except Exception as e:
@@ -81,48 +329,7 @@ def check_is_ad_with_ai(title):
         return False
 
 
-def load_history():
-    default_history = {
-        "hot": [],
-        "new": [],
-        "top": [],
-        "rising": [],
-        "media": [],
-        "ads": []
-    }
-    if os.path.exists(HISTORY_FILE):
-        try:
-            with open(HISTORY_FILE, "r") as f:
-                data = json.load(f)
-                if isinstance(data, dict):
-                    # Gabungkan dengan default agar key selalu ada
-                    for key in default_history:
-                        if key in data:
-                            default_history[key] = data[key]
-        except Exception as e:
-            logging.error(f"Error loading history file: {e}")
-    return default_history
-
-
-def save_history(history):
-    """Save history atomically: write to temp file then replace."""
-    try:
-        dir_name = os.path.dirname(os.path.abspath(HISTORY_FILE))
-        fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w") as f:
-                json.dump(history, f)
-            os.replace(tmp_path, HISTORY_FILE)
-        except Exception:
-            # Clean up temp file on failure
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
-    except Exception as e:
-        logging.error(f"Error saving history: {e}")
-
+# ================= TELEGRAM SENDERS =================
 
 def send_message(token, chat_id, text):
     if not chat_id or chat_id.startswith("YOUR_"):
@@ -130,7 +337,7 @@ def send_message(token, chat_id, text):
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
     try:
-        res = requests.post(url, json=payload, timeout=20)
+        res = _http.post(url, json=payload, timeout=20)
         return res.json()
     except Exception as e:
         logging.error(f"Error sending message: {e}")
@@ -138,16 +345,28 @@ def send_message(token, chat_id, text):
 
 
 def send_photo(token, chat_id, photo_url, caption):
-    """Kirim foto ke Telegram. Download dengan retry, Upload tanpa retry."""
     if not chat_id or chat_id.startswith("YOUR_"):
-        return False
+        return None
     url = f"https://api.telegram.org/bot{token}/sendPhoto"
 
-    # 1. DOWNLOAD (Boleh retry)
+    # Check if photo_url is already a file_id (not starting with http)
+    if isinstance(photo_url, str) and not photo_url.startswith(("http://", "https://")):
+        logging.info(f"Sending photo by file_id to {chat_id}...")
+        try:
+            payload = {"chat_id": chat_id, "photo": photo_url, "caption": caption, "parse_mode": "HTML"}
+            res = _http.post(url, json=payload, timeout=30)
+            if res.status_code == 200 and res.json().get("ok"):
+                return photo_url
+            logging.warning(f"Failed to send photo by file_id. Response: {res.text[:200]}")
+        except Exception as e:
+            logging.error(f"Error sending photo by file_id: {e}")
+        return None
+
+    logging.info(f"Downloading photo: {photo_url}")
     photo_data = None
     for attempt in range(3):
         try:
-            res = requests.get(photo_url, headers={"User-Agent": USER_AGENT}, timeout=30)
+            res = _http.get(photo_url, timeout=30)
             if res.status_code == 200:
                 photo_data = res.content
                 break
@@ -158,80 +377,172 @@ def send_photo(token, chat_id, photo_url, caption):
 
     if not photo_data:
         logging.error(f"Failed to download photo after 3 attempts: {photo_url}")
-        return False
+        return None
 
-    # 2. UPLOAD (Tanpa retry)
+    logging.info(f"Uploading photo to Telegram ({len(photo_data)} bytes) to {chat_id}...")
     try:
         files = {'photo': ('photo.jpg', photo_data)}
         payload = {"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"}
-        r = requests.post(url, data=payload, files=files, timeout=120)
-        if not (r.status_code == 200 and r.json().get("ok")):
-            logging.warning(f"Telegram returned non-ok for photo, assuming success. Response: {r.text[:200]}")
+        r = _http.post(url, data=payload, files=files, timeout=120)
+        if r.status_code == 200 and r.json().get("ok"):
+            res_json = r.json()
+            try:
+                file_id = res_json.get("result", {}).get("photo", [])[-1].get("file_id")
+                logging.info(f"Photo uploaded successfully. file_id: {file_id}")
+                return file_id
+            except:
+                return True
+        logging.warning(f"Telegram returned non-ok for photo. Response: {r.text[:200]}")
     except Exception as e:
-        logging.error(f"Error uploading photo to Telegram, assuming success: {e}")
-    return True
+        logging.error(f"Error uploading photo to Telegram: {e}")
+    return None
 
 
 def send_gallery(token, chat_id, urls, caption):
-    """Kirim album ke Telegram. Download dengan retry, Upload tanpa retry per chunk."""
     if not chat_id or chat_id.startswith("YOUR_"):
-        return False
+        return None
     url_api = f"https://api.telegram.org/bot{token}/sendMediaGroup"
 
+    # Check if urls are already file_ids (first element is not starting with http)
+    if urls and isinstance(urls, list) and not urls[0].startswith(("http://", "https://")):
+        logging.info(f"Sending gallery by file_ids to {chat_id}...")
+        try:
+            media_group = []
+            for i, file_id in enumerate(urls):
+                media_item = {"type": "photo", "media": file_id}
+                if i == 0:
+                    media_item["caption"] = caption
+                    media_item["parse_mode"] = "HTML"
+                media_group.append(media_item)
+            
+            payload = {"chat_id": chat_id, "media": json.dumps(media_group)}
+            res = _http.post(url_api, json=payload, timeout=120)
+            if res.status_code == 200 and res.json().get("ok"):
+                return urls
+            logging.warning(f"Failed to send gallery by file_ids. Response: {res.text[:200]}")
+        except Exception as e:
+            logging.error(f"Error sending gallery by file_ids: {e}")
+        return None
+
     chunks = [urls[i:i + 10] for i in range(0, len(urls), 10)]
-    
+    uploaded_file_ids = []
+
     for chunk_idx, chunk_urls in enumerate(chunks):
-        # 1. DOWNLOAD CHUNK (Boleh retry per gambar)
         files = {}
         media_group = []
         for i, img_url in enumerate(chunk_urls):
+            logging.info(f"Downloading gallery image ({chunk_idx * 10 + i + 1}/{len(urls)}): {img_url}")
             photo_data = None
             for attempt in range(3):
                 try:
-                    res = requests.get(img_url, headers={"User-Agent": USER_AGENT}, timeout=30)
+                    res = _http.get(img_url, timeout=30)
                     if res.status_code == 200:
                         photo_data = res.content
                         break
                 except Exception as e:
                     logging.error(f"Attempt {attempt+1} error downloading gallery img: {e}")
                 time.sleep(2)
-                
+
             if photo_data:
                 file_key = f'photo_{chunk_idx}_{i}'
                 files[file_key] = (f'{file_key}.jpg', photo_data)
                 media_item = {"type": "photo", "media": f"attach://{file_key}"}
-                if i == 0 and chunk_idx == 0:
+                if i == 0:
                     media_item["caption"] = caption
                     media_item["parse_mode"] = "HTML"
                 media_group.append(media_item)
-                
+
         if not media_group:
             continue
 
-        # 2. UPLOAD CHUNK (Tanpa retry)
+        logging.info(f"Uploading gallery chunk ({len(media_group)} images) to Telegram to {chat_id}...")
         try:
             payload = {"chat_id": chat_id, "media": json.dumps(media_group)}
-            r = requests.post(url_api, data=payload, files=files, timeout=300)
-            if not (r.status_code == 200 and r.json().get("ok")):
+            r = _http.post(url_api, data=payload, files=files, timeout=300)
+            if r.status_code == 200 and r.json().get("ok"):
+                res_json = r.json()
+                try:
+                    results = res_json.get("result", [])
+                    for msg in results:
+                        photo_list = msg.get("photo", [])
+                        if photo_list:
+                            uploaded_file_ids.append(photo_list[-1].get("file_id"))
+                except Exception as ex:
+                    logging.warning(f"Could not parse file_ids from gallery response: {ex}")
+            else:
                 logging.warning(f"Telegram returned non-ok for gallery chunk. Response: {r.text[:200]}")
         except Exception as e:
             logging.error(f"Error uploading gallery chunk: {e}")
-            
+
         time.sleep(3)
-    return True
+    return uploaded_file_ids if uploaded_file_ids else True
+
+
+def upload_large_video_with_pyrogram(video_url, caption, chat_id, video_data=None):
+    if not API_ID or not API_HASH:
+        logging.error("API_ID or API_HASH not set. Cannot use Pyrogram for large files.")
+        return None
+
+    temp_path = f"temp_video_{int(time.time())}.mp4"
+    try:
+        if video_data:
+            with open(temp_path, "wb") as f:
+                f.write(video_data)
+        else:
+            logging.info(f"Downloading large video directly for Pyrogram: {video_url}")
+            with _http.get(video_url, timeout=120, stream=True) as res:
+                if res.status_code == 200:
+                    with open(temp_path, "wb") as f:
+                        for chunk in res.iter_content(chunk_size=1024 * 1024):
+                            f.write(chunk)
+                else:
+                    logging.error(f"Failed to download large video: Status {res.status_code}")
+                    return None
+                    
+        async def _upload():
+            async with Client("user_session", api_id=API_ID, api_hash=API_HASH, phone_number=PHONE_NUMBER) as app:
+                logging.info(f"Pyrogram logged in. Uploading large video to {chat_id}...")
+                target_chat_id = int(chat_id) if chat_id.lstrip('-').isdigit() else chat_id
+                msg = await app.send_video(
+                    chat_id=target_chat_id,
+                    video=temp_path,
+                    caption=caption,
+                    supports_streaming=True
+                )
+                return msg.video.file_id if msg.video else True
+                
+        return asyncio.run(_upload())
+    except Exception as e:
+        logging.error(f"Error in Pyrogram upload: {e}")
+        return None
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
 
 
 def send_video(token, chat_id, video_url, caption, moving_preview_url=None, photo_preview_url=None):
-    """Kirim video ke Telegram. Download dengan retry, Upload tanpa retry."""
     if not chat_id or chat_id.startswith("YOUR_"):
-        return False
+        return None
     url = f"https://api.telegram.org/bot{token}/sendVideo"
 
-    # 1. DOWNLOAD (Boleh retry)
+    # Check if video_url is already a file_id (not starting with http)
+    if isinstance(video_url, str) and not video_url.startswith(("http://", "https://")):
+        logging.info(f"Sending video by file_id to {chat_id}...")
+        try:
+            payload = {"chat_id": chat_id, "video": video_url, "caption": caption, "parse_mode": "HTML", "supports_streaming": True}
+            res = _http.post(url, json=payload, timeout=30)
+            if res.status_code == 200 and res.json().get("ok"):
+                return video_url
+            logging.warning(f"Failed to send video by file_id. Response: {res.text[:200]}")
+        except Exception as e:
+            logging.error(f"Error sending video by file_id: {e}")
+        return None
+
+    logging.info(f"Downloading video from: {video_url}")
     video_data = None
     for attempt in range(3):
         try:
-            with requests.get(video_url, headers={"User-Agent": USER_AGENT}, timeout=60, stream=True) as res:
+            with _http.get(video_url, timeout=60, stream=True) as res:
                 if res.status_code != 200:
                     logging.warning(f"Attempt {attempt+1} failed to fetch video: Status {res.status_code}")
                     time.sleep(5)
@@ -239,25 +550,36 @@ def send_video(token, chat_id, video_url, caption, moving_preview_url=None, phot
 
                 content_length = res.headers.get("Content-Length")
                 if content_length and int(content_length) > MAX_VIDEO_SIZE:
-                    logging.warning(f"Video too large ({content_length} bytes). Trying moving preview.")
+                    logging.warning(f"Video too large ({content_length} bytes) for Bot API. Using Pyrogram user account...")
+                    pyrogram_result = upload_large_video_with_pyrogram(video_url, caption, chat_id)
+                    if pyrogram_result:
+                        return pyrogram_result
+                    logging.warning(f"Pyrogram upload failed. Trying moving preview.")
                     if moving_preview_url and moving_preview_url != video_url:
                         return send_video(token, chat_id, moving_preview_url, caption)
                     elif photo_preview_url:
                         return send_photo(token, chat_id, photo_preview_url, caption)
-                    return False
+                    return None
 
                 chunks = []
                 downloaded = 0
                 for chunk in res.iter_content(chunk_size=1024 * 1024):
                     downloaded += len(chunk)
                     if downloaded > MAX_VIDEO_SIZE:
-                        logging.warning(f"Video exceeded limit during download. Trying preview.")
-                        if moving_preview_url and moving_preview_url != video_url:
-                            return send_video(token, chat_id, moving_preview_url, caption)
-                        elif photo_preview_url:
-                            return send_photo(token, chat_id, photo_preview_url, caption)
-                        return False
+                        break
                     chunks.append(chunk)
+
+                if downloaded > MAX_VIDEO_SIZE:
+                    logging.warning(f"Video exceeded limit during download. Using Pyrogram user account...")
+                    pyrogram_result = upload_large_video_with_pyrogram(video_url, caption, chat_id)
+                    if pyrogram_result:
+                        return pyrogram_result
+                    logging.warning(f"Pyrogram upload failed. Trying preview.")
+                    if moving_preview_url and moving_preview_url != video_url:
+                        return send_video(token, chat_id, moving_preview_url, caption)
+                    elif photo_preview_url:
+                        return send_photo(token, chat_id, photo_preview_url, caption)
+                    return None
 
                 video_data = b"".join(chunks)
                 break
@@ -267,20 +589,29 @@ def send_video(token, chat_id, video_url, caption, moving_preview_url=None, phot
 
     if not video_data:
         logging.error(f"Failed to download video after 3 attempts: {video_url}")
-        return False
+        return None
 
-    # 2. UPLOAD (Tanpa retry)
+    logging.info(f"Uploading video to Telegram ({len(video_data)} bytes) to {chat_id}...")
     try:
         files = {'video': ('video.mp4', video_data)}
-        payload = {"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"}
-        r = requests.post(url, data=payload, files=files, timeout=300)
-        if not (r.status_code == 200 and r.json().get("ok")):
-            logging.warning(f"Telegram returned non-ok for video. Assuming success. Response: {r.text[:200]}")
+        payload = {"chat_id": chat_id, "caption": caption, "parse_mode": "HTML", "supports_streaming": True}
+        r = _http.post(url, data=payload, files=files, timeout=300)
+        if r.status_code == 200 and r.json().get("ok"):
+            res_json = r.json()
+            try:
+                file_id = res_json.get("result", {}).get("video", {}).get("file_id")
+                logging.info(f"Video uploaded successfully. file_id: {file_id}")
+                return file_id
+            except:
+                return True
+        logging.warning(f"Telegram returned non-ok for video. Response: {r.text[:200]}")
     except Exception as e:
-        logging.error(f"Error uploading video to Telegram, assuming success: {e}")
-    
-    return True
+        logging.error(f"Error uploading video to Telegram: {e}")
 
+    return None
+
+
+# ================= MEDIA PARSER =================
 
 def get_media_type_and_url(post):
     data = post['data']
@@ -288,7 +619,6 @@ def get_media_type_and_url(post):
     domain = data.get('domain', '')
     is_video = data.get('is_video', False)
 
-    # 1. Ambil photo preview URL (diam)
     photo_preview = ""
     try:
         photo_preview = data.get('preview', {}).get('images', [{}])[0].get('source', {}).get('url', '')
@@ -296,7 +626,6 @@ def get_media_type_and_url(post):
     except:
         photo_preview = data.get('thumbnail', '')
 
-    # 2. Ambil moving preview URL (media bergerak resolusi rendah/gif)
     moving_preview = ""
     try:
         variants = data.get('preview', {}).get('images', [{}])[0].get('variants', {})
@@ -328,8 +657,6 @@ def get_media_type_and_url(post):
         return "video", url, moving_preview, photo_preview
     elif url.endswith(('.jpg', '.jpeg', '.png')):
         return "photo", url.replace('&amp;', '&'), moving_preview, photo_preview
-    
-    # Deteksi Gallery (Album Reddit)
     elif 'gallery_data' in data and 'media_metadata' in data:
         try:
             urls = []
@@ -347,28 +674,29 @@ def get_media_type_and_url(post):
                 return "link", url, moving_preview, photo_preview
         except:
             return "link", url, moving_preview, photo_preview
-    
     elif data.get('is_gallery'):
         return "photo", url, moving_preview, photo_preview
     else:
         return "link", url, moving_preview, photo_preview
 
 
-def process_feed(history, feed_type):
+# ================= FEED PROCESSOR =================
+
+def process_feed(feed_type):
     token = BOT_TOKEN
     channels = CHANNELS
 
     url = f"https://old.reddit.com/r/{SUBREDDIT}/{feed_type}.json?limit=50"
-    headers = {"User-Agent": USER_AGENT}
 
     try:
-        response = requests.get(url, headers=headers, timeout=30)
+        response = _http.get(url, timeout=30)
         if response.status_code != 200:
             logging.error(f"Failed to fetch {feed_type}: HTTP {response.status_code}")
             return
     except Exception as e:
         logging.error(f"Error fetching {feed_type}: {e}")
         return
+
     try:
         data = response.json()
     except requests.exceptions.JSONDecodeError:
@@ -376,6 +704,7 @@ def process_feed(history, feed_type):
         return
 
     posts = data.get('data', {}).get('children', [])
+    new_posts = 0
 
     for post in reversed(posts):
         if _shutdown_requested:
@@ -388,72 +717,98 @@ def process_feed(history, feed_type):
         if post_data.get('stickied', False):
             continue
 
-        # AI Filter
-        if post_id not in history[feed_type]:
-            if post_id not in history["ads"]:
-                if check_is_ad_with_ai(title):
-                    history["ads"].append(post_id)
-                    if len(history["ads"]) > 500:
-                        history["ads"] = history["ads"][-500:]
-                    history[feed_type].append(post_id)
-                    save_history(history)
-                    continue
-            else:
-                logging.info(f"Skipping known ad in {feed_type}: {post_id}")
-                history[feed_type].append(post_id)
-                save_history(history)
-                continue
+        if is_processed(post_id, feed_type):
+            continue
+
+        if is_known_ad(post_id):
+            mark_processed(post_id, feed_type)
+            logging.info(f"Skipping known ad in {feed_type}: {post_id}")
+            continue
+
+        if check_is_ad_with_ai(title):
+            mark_processed(post_id, feed_type, is_ad=True, also_mark_ad=True)
+            continue
 
         media_type, media_url, moving_preview, photo_preview = get_media_type_and_url(post)
+
         if media_type == "link":
+            mark_processed(post_id, feed_type)
+            continue
+
+        if is_media_url_processed(media_url, feed_type):
+            mark_processed(post_id, feed_type, media_url=media_url)
+            logging.info(f"Skipping crosspost/duplicate URL in {feed_type}: {post_id}")
             continue
 
         caption = f"<b>{title}</b>"
+        chat_ids = _get_chat_ids(channels, feed_type)
 
-        # 1. Kirim ke channel feed (hot, new, top, atau rising)
-        if post_id not in history[feed_type]:
-            logging.info(f"New post found in {feed_type}: {post_id}")
-            chat_id = channels.get(feed_type)
-            if chat_id:
-                if media_type == "photo":
-                    send_photo(token, chat_id, media_url, caption)
-                elif media_type == "video":
-                    send_video(token, chat_id, media_url, caption, moving_preview, photo_preview)
-                elif media_type == "gallery":
-                    send_gallery(token, chat_id, media_url, caption)
-                else:
-                    send_message(token, chat_id, f"{caption}\n{media_url}")
-                time.sleep(2)
+        mark_processed(post_id, feed_type, media_url=media_url)
+        new_posts += 1
 
-            # [FIX ANTI-DUPLIKAT] Fire and Forget: 
-            # Selalu catat ID ke history meskipun API Telegram error/timeout.
-            # Ini memastikan bot tidak pernah terjebak dalam loop mengirim foto/ID yang sama.
-            history[feed_type].append(post_id)
-            if len(history[feed_type]) > 200:
-                history[feed_type] = history[feed_type][-200:]
-            save_history(history)
+        for chat_id in chat_ids:
+            logging.info(f"→ SENDING to channel {feed_type}({chat_id}) | post={post_id}")
+            if media_type == "photo":
+                res = send_photo(token, chat_id, media_url, caption)
+                if isinstance(res, str):
+                    media_url = res
+                track_send(post_id, feed_type, feed_type)
+            elif media_type == "video":
+                res = send_video(token, chat_id, media_url, caption, moving_preview, photo_preview)
+                if isinstance(res, str):
+                    media_url = res
+                track_send(post_id, feed_type, feed_type)
+            elif media_type == "gallery":
+                res = send_gallery(token, chat_id, media_url, caption)
+                if isinstance(res, list) and res:
+                    media_url = res
+                track_send(post_id, feed_type, feed_type)
+            else:
+                send_message(token, chat_id, f"{caption}\n{media_url}")
+                track_send(post_id, feed_type, feed_type)
+            time.sleep(2)
 
-        # 2. Kirim ke channel kpop5 (Photo) & kpop6 (Video)
-        if feed_type == "new" and post_id not in history["media"]:
-            if media_type == "photo" and channels.get("photo"):
-                logging.info(f"Routing new photo to kpop5: {post_id}")
-                send_photo(token, channels["photo"], media_url, caption)
-                time.sleep(2)
-            elif media_type == "gallery" and channels.get("photo"):
-                logging.info(f"Routing new gallery to kpop5: {post_id}")
-                send_gallery(token, channels["photo"], media_url, caption)
-                time.sleep(2)
-            elif media_type == "video" and channels.get("video"):
-                logging.info(f"Routing new video to kpop6: {post_id}")
-                send_video(token, channels["video"], media_url, caption, moving_preview, photo_preview)
-                time.sleep(2)
+        if feed_type == "new" and not is_processed(post_id, "media"):
+            if is_media_url_processed(media_url, "media"):
+                mark_processed(post_id, "media", media_url=media_url)
+                logging.info(f"Skipping crosspost routing to media channel: {post_id}")
+                continue
 
-            # [FIX ANTI-DUPLIKAT] Fire and Forget untuk history media
-            history["media"].append(post_id)
-            if len(history["media"]) > 1000:
-                history["media"] = history["media"][-1000:]
-            save_history(history)
+            mark_processed(post_id, "media", media_url=media_url)
 
+            photo_chat_ids = _get_chat_ids(channels, "photo")
+            video_chat_ids = _get_chat_ids(channels, "video")
+
+            if media_type == "photo" and photo_chat_ids:
+                for chat_id in photo_chat_ids:
+                    logging.info(f"→ ROUTING to channel photo({chat_id}) | post={post_id}")
+                    res = send_photo(token, chat_id, media_url, caption)
+                    if isinstance(res, str):
+                        media_url = res
+                    track_send(post_id, "media", "photo")
+                    time.sleep(2)
+            elif media_type == "gallery" and photo_chat_ids:
+                for chat_id in photo_chat_ids:
+                    logging.info(f"→ ROUTING to channel photo({chat_id}) | post={post_id}")
+                    res = send_gallery(token, chat_id, media_url, caption)
+                    if isinstance(res, list) and res:
+                        media_url = res
+                    track_send(post_id, "media", "photo")
+                    time.sleep(2)
+            elif media_type == "video" and video_chat_ids:
+                for chat_id in video_chat_ids:
+                    logging.info(f"→ ROUTING to channel video({chat_id}) | post={post_id}")
+                    res = send_video(token, chat_id, media_url, caption, moving_preview, photo_preview)
+                    if isinstance(res, str):
+                        media_url = res
+                    track_send(post_id, "media", "video")
+                    time.sleep(2)
+
+    if new_posts > 0:
+        logging.info(f"Processed {new_posts} new posts from {feed_type}")
+
+
+# ================= MAIN =================
 
 def main():
     if not BOT_TOKEN:
@@ -462,16 +817,26 @@ def main():
     if not GROQ_API_KEY:
         logging.warning("GROQ_API_KEY not set. AI ad filtering will be disabled.")
 
-    logging.info(f"Starting Reddit Telegram Bot for r/{SUBREDDIT}")
-    history = load_history()
+    if not _acquire_pid_lock():
+        logging.error("Exiting to prevent duplicate instances.")
+        sys.exit(1)
 
+    logging.info(f"Starting Reddit Telegram Bot for r/{SUBREDDIT}")
+    init_db()
+    logging.info(f"DB stats: {get_stats()}")
+    logging.info(f"Send count tracker active — duplicate sends will be logged as WARNING")
+
+    iteration = 0
     while not _shutdown_requested:
         logging.info("Checking feeds...")
         for feed in FEED_TYPES:
             if _shutdown_requested:
                 break
-            process_feed(history, feed)
-            save_history(history)
+            process_feed(feed)
+
+        iteration += 1
+        if iteration % 288 == 0:
+            cleanup_old_entries()
 
         if not _shutdown_requested:
             logging.info(f"Sleeping for {CHECK_INTERVAL_SECONDS} seconds...")
@@ -480,8 +845,10 @@ def main():
                     break
                 time.sleep(1)
 
-    save_history(history)
-    logging.info("Bot stopped gracefully. History saved.")
+    _release_pid_lock()
+    if _db_conn:
+        _db_conn.close()
+    logging.info("Bot stopped gracefully.")
 
 
 if __name__ == "__main__":

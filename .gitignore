@@ -5,6 +5,9 @@ planAI.txt
 
 # Runtime data
 history.json
+history.json.bak
+history.db
+bot.pid
 
 # Python
 __pycache__/
@@ -15,3 +18,5 @@ dist/
 build/
 venv/
 .venv/
+*.session
+*.session-journal
