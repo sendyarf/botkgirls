@@ -478,37 +478,49 @@ def send_gallery(token, chat_id, urls, caption):
     return uploaded_file_ids if uploaded_file_ids else True
 
 
-def download_hls_stream(hls_url, output_path, timeout=300):
-    """Download an HLS (.m3u8) stream and mux to MP4 using ffmpeg (no re-encode).
-    
-    Requires ffmpeg to be installed on the VPS: apt install ffmpeg
+def download_video_ytdlp(page_url, output_path, timeout=300):
+    """Download a video from a hosting site using yt-dlp.
+
+    Supports redgifs, gfycat, and 1000+ other sites automatically.
+    Handles HLS streams, authentication, and quality selection internally.
     Returns True on success, False on failure.
+
+    Install: pip install yt-dlp
     """
     import subprocess
     try:
         cmd = [
-            'ffmpeg', '-y',
-            '-i', hls_url,
-            '-c', 'copy',            # remux only — no re-encode
-            '-movflags', '+faststart',
-            output_path
+            'yt-dlp',
+            '--no-playlist',
+            '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+            '--merge-output-format', 'mp4',
+            '-o', output_path,
+            '--no-warnings',
+            '--quiet',
+            page_url
         ]
         result = subprocess.run(cmd, capture_output=True, timeout=timeout)
         if result.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-            logging.info(f"HLS downloaded: {output_path} ({os.path.getsize(output_path):,} bytes)")
+            logging.info(f"yt-dlp downloaded: {output_path} ({os.path.getsize(output_path):,} bytes)")
             return True
         stderr = result.stderr.decode(errors='replace')[-400:]
-        logging.error(f"ffmpeg failed (code {result.returncode}): {stderr}")
+        stdout = result.stdout.decode(errors='replace')[-200:]
+        logging.error(f"yt-dlp failed (code {result.returncode}): {stderr} | {stdout}")
         return False
     except subprocess.TimeoutExpired:
-        logging.error("ffmpeg timed out downloading HLS stream")
+        logging.error("yt-dlp timed out downloading video")
         return False
     except FileNotFoundError:
-        logging.error("ffmpeg not found — install it on the VPS: apt install ffmpeg")
+        logging.error("yt-dlp not found — install it: pip install yt-dlp")
         return False
     except Exception as e:
-        logging.error(f"HLS download error: {e}")
+        logging.error(f"yt-dlp error: {e}")
         return False
+
+
+# Domains where the Reddit URL is a page link, not a direct file.
+# yt-dlp handles download + HLS streaming + quality selection for these.
+YTDLP_DOMAINS = {'redgifs.com', 'www.redgifs.com', 'gfycat.com', 'www.gfycat.com'}
 
 
 def upload_large_video_with_pyrogram(video_url, caption, chat_id, video_data=None, photo_preview_url=None, video_path=None):
@@ -591,39 +603,46 @@ def send_video(token, chat_id, video_url, caption, moving_preview_url=None, phot
 
     logging.info(f"Downloading video from: {video_url}")
 
-    # ── HLS stream (.m3u8) — must be downloaded via ffmpeg first ──
-    if isinstance(video_url, str) and '.m3u8' in video_url:
-        temp_hls = f"temp_hls_{int(time.time())}.mp4"
+    # ── yt-dlp block: handle video hosting pages (redgifs, gfycat, etc.) ──
+    # These URLs are watch pages, not direct files — yt-dlp resolves
+    # HLS streams, picks best quality, and handles auth automatically.
+    try:
+        from urllib.parse import urlparse
+        _netloc = urlparse(video_url).netloc.lower()
+    except Exception:
+        _netloc = ''
+
+    if _netloc in YTDLP_DOMAINS:
+        temp_ytdlp = f"temp_ytdlp_{int(time.time())}.mp4"
         try:
-            logging.info(f"HLS stream detected. Downloading via ffmpeg: {video_url}")
-            if not download_hls_stream(video_url, temp_hls):
-                logging.error("HLS download failed.")
+            logging.info(f"yt-dlp download: {video_url}")
+            if not download_video_ytdlp(video_url, temp_ytdlp):
+                logging.error("yt-dlp download failed.")
                 if photo_preview_url:
                     return send_photo(token, chat_id, photo_preview_url, caption)
                 return None
 
-            file_size = os.path.getsize(temp_hls)
+            file_size = os.path.getsize(temp_ytdlp)
             if file_size > MAX_VIDEO_SIZE:
-                logging.warning(f"HLS result too large ({file_size:,} bytes). Using Pyrogram...")
-                # Pass path directly so Pyrogram doesn't re-download
+                logging.warning(f"yt-dlp result too large ({file_size:,} bytes). Using Pyrogram...")
                 result = upload_large_video_with_pyrogram(
                     video_url, caption, chat_id,
-                    video_path=temp_hls,
+                    video_path=temp_ytdlp,
                     photo_preview_url=photo_preview_url
                 )
-                temp_hls = None  # ownership transferred — do NOT delete
+                temp_ytdlp = None  # ownership transferred — do NOT delete
                 return result
 
             # Small enough for Bot API — read into memory then send
-            with open(temp_hls, 'rb') as fh:
-                hls_video_data = fh.read()
+            with open(temp_ytdlp, 'rb') as fh:
+                ytdlp_video_data = fh.read()
         finally:
-            if temp_hls and os.path.exists(temp_hls):
-                os.remove(temp_hls)
+            if temp_ytdlp and os.path.exists(temp_ytdlp):
+                os.remove(temp_ytdlp)
 
-        logging.info(f"Uploading HLS-converted video ({len(hls_video_data):,} bytes) to {chat_id}...")
+        logging.info(f"Uploading yt-dlp video ({len(ytdlp_video_data):,} bytes) to {chat_id}...")
         try:
-            files = {'video': ('video.mp4', hls_video_data)}
+            files = {'video': ('video.mp4', ytdlp_video_data)}
             payload = {"chat_id": chat_id, "caption": caption, "parse_mode": "HTML", "supports_streaming": True}
             if photo_preview_url:
                 try:
@@ -636,15 +655,15 @@ def send_video(token, chat_id, video_url, caption, moving_preview_url=None, phot
             if r.status_code == 200 and r.json().get("ok"):
                 try:
                     file_id = r.json().get("result", {}).get("video", {}).get("file_id")
-                    logging.info(f"HLS video uploaded. file_id: {file_id}")
+                    logging.info(f"yt-dlp video uploaded. file_id: {file_id}")
                     return file_id
                 except:
                     return True
-            logging.warning(f"Telegram error for HLS video: {r.text[:200]}")
+            logging.warning(f"Telegram error for yt-dlp video: {r.text[:200]}")
         except Exception as e:
-            logging.error(f"Error uploading HLS video: {e}")
+            logging.error(f"Error uploading yt-dlp video: {e}")
         return None
-    # ── end HLS block ──
+    # ── end yt-dlp block ──
 
     video_data = None
     for attempt in range(3):
@@ -734,49 +753,6 @@ def send_video(token, chat_id, video_url, caption, moving_preview_url=None, phot
 # ================= MEDIA PARSER =================
 
 
-def get_redgifs_direct_url(page_url):
-    """Fetch the real direct MP4 URL from Redgifs API v2 (no watermark).
-    
-    Redgifs embeds a watermark when you use the watch-page URL directly.
-    This function calls the API to get the actual source file.
-    """
-    try:
-        # Extract gif ID from URLs like:
-        #   https://www.redgifs.com/watch/somegifid
-        #   https://redgifs.com/watch/SomeGifId-extra
-        gif_id = page_url.rstrip('/').split('/')[-1].split('-')[0].lower()
-        if not gif_id:
-            logging.warning("Redgifs: could not extract gif ID from URL")
-            return None
-
-        # Step 1: get a short-lived anonymous token
-        token_res = _http.get("https://api.redgifs.com/v2/auth/temporary", timeout=10)
-        if token_res.status_code != 200:
-            logging.warning(f"Redgifs: failed to get auth token (HTTP {token_res.status_code})")
-            return None
-        token = token_res.json().get("token")
-        if not token:
-            logging.warning("Redgifs: auth token missing in response")
-            return None
-
-        # Step 2: fetch gif metadata
-        headers = {"Authorization": f"Bearer {token}"}
-        gif_res = _http.get(f"https://api.redgifs.com/v2/gifs/{gif_id}", headers=headers, timeout=10)
-        if gif_res.status_code != 200:
-            logging.warning(f"Redgifs: gif metadata request failed (HTTP {gif_res.status_code})")
-            return None
-
-        urls = gif_res.json().get("gif", {}).get("urls", {})
-        # Prefer HD, fall back to SD
-        direct_url = urls.get("hd") or urls.get("sd")
-        if direct_url:
-            logging.info(f"Redgifs: resolved direct URL → {direct_url}")
-        else:
-            logging.warning(f"Redgifs: no hd/sd URL in response: {urls}")
-        return direct_url
-    except Exception as e:
-        logging.warning(f"Redgifs API error: {e}")
-        return None
 
 def get_media_type_and_url(post):
     data = post['data']
@@ -804,18 +780,9 @@ def get_media_type_and_url(post):
         pass
 
     if domain == 'redgifs.com':
-        direct_url = get_redgifs_direct_url(url)
-        if direct_url:
-            return "video", direct_url, moving_preview, photo_preview
-        # Fallback: try the old thumbnail trick
-        try:
-            thumb = data.get('secure_media', {}).get('oembed', {}).get('thumbnail_url', '')
-            if '-poster.jpg' in thumb:
-                direct_mp4 = thumb.replace('-poster.jpg', '.mp4')
-                return "video", direct_mp4, moving_preview, photo_preview
-        except:
-            pass
-        logging.warning(f"Redgifs: all resolution methods failed for {url}")
+        # yt-dlp handles redgifs URLs directly — pass the page URL through.
+        # send_video() will route it to download_video_ytdlp() automatically.
+        return "video", url, moving_preview, photo_preview
 
     if is_video:
         try:
