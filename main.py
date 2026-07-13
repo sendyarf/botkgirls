@@ -478,46 +478,95 @@ def send_gallery(token, chat_id, urls, caption):
     return uploaded_file_ids if uploaded_file_ids else True
 
 
-def upload_large_video_with_pyrogram(video_url, caption, chat_id, video_data=None):
+def download_hls_stream(hls_url, output_path, timeout=300):
+    """Download an HLS (.m3u8) stream and mux to MP4 using ffmpeg (no re-encode).
+    
+    Requires ffmpeg to be installed on the VPS: apt install ffmpeg
+    Returns True on success, False on failure.
+    """
+    import subprocess
+    try:
+        cmd = [
+            'ffmpeg', '-y',
+            '-i', hls_url,
+            '-c', 'copy',            # remux only — no re-encode
+            '-movflags', '+faststart',
+            output_path
+        ]
+        result = subprocess.run(cmd, capture_output=True, timeout=timeout)
+        if result.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            logging.info(f"HLS downloaded: {output_path} ({os.path.getsize(output_path):,} bytes)")
+            return True
+        stderr = result.stderr.decode(errors='replace')[-400:]
+        logging.error(f"ffmpeg failed (code {result.returncode}): {stderr}")
+        return False
+    except subprocess.TimeoutExpired:
+        logging.error("ffmpeg timed out downloading HLS stream")
+        return False
+    except FileNotFoundError:
+        logging.error("ffmpeg not found — install it on the VPS: apt install ffmpeg")
+        return False
+    except Exception as e:
+        logging.error(f"HLS download error: {e}")
+        return False
+
+
+def upload_large_video_with_pyrogram(video_url, caption, chat_id, video_data=None, photo_preview_url=None, video_path=None):
     if not API_ID or not API_HASH:
         logging.error("API_ID or API_HASH not set. Cannot use Pyrogram for large files.")
         return None
 
-    temp_path = f"temp_video_{int(time.time())}.mp4"
+    # If a pre-built file path is provided, use it directly (caller is responsible for cleanup).
+    # Otherwise create our own temp file.
+    owns_file = video_path is None
+    if video_path is None:
+        video_path = f"temp_video_{int(time.time())}.mp4"
+
     try:
-        if video_data:
-            with open(temp_path, "wb") as f:
-                f.write(video_data)
-        else:
-            logging.info(f"Downloading large video directly for Pyrogram: {video_url}")
-            with _http.get(video_url, timeout=120, stream=True) as res:
-                if res.status_code == 200:
-                    with open(temp_path, "wb") as f:
-                        for chunk in res.iter_content(chunk_size=1024 * 1024):
-                            f.write(chunk)
-                else:
-                    logging.error(f"Failed to download large video: Status {res.status_code}")
-                    return None
-                    
+        if owns_file:
+            if video_data:
+                with open(video_path, "wb") as f:
+                    f.write(video_data)
+            else:
+                logging.info(f"Downloading large video directly for Pyrogram: {video_url}")
+                with _http.get(video_url, timeout=120, stream=True) as res:
+                    if res.status_code == 200:
+                        with open(video_path, "wb") as f:
+                            for chunk in res.iter_content(chunk_size=1024 * 1024):
+                                f.write(chunk)
+                    else:
+                        logging.error(f"Failed to download large video: Status {res.status_code}")
+                        return None
+
         async def _upload():
             async with Client("user_session", api_id=API_ID, api_hash=API_HASH, phone_number=PHONE_NUMBER) as app:
                 logging.info(f"Pyrogram logged in. Uploading large video to {chat_id}...")
                 target_chat_id = int(chat_id) if chat_id.lstrip('-').isdigit() else chat_id
-                msg = await app.send_video(
+                send_kwargs = dict(
                     chat_id=target_chat_id,
-                    video=temp_path,
+                    video=video_path,
                     caption=caption,
-                    supports_streaming=True
+                    supports_streaming=True,
                 )
+                # Attach thumbnail if available so mobile shows a proper preview
+                if photo_preview_url:
+                    import tempfile, urllib.request
+                    thumb_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+                    try:
+                        urllib.request.urlretrieve(photo_preview_url, thumb_tmp.name)
+                        send_kwargs["thumb"] = thumb_tmp.name
+                    except Exception as thumb_err:
+                        logging.warning(f"Could not fetch thumbnail for Pyrogram: {thumb_err}")
+                msg = await app.send_video(**send_kwargs)
                 return msg.video.file_id if msg.video else True
-                
+
         return asyncio.run(_upload())
     except Exception as e:
         logging.error(f"Error in Pyrogram upload: {e}")
         return None
     finally:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+        if owns_file and os.path.exists(video_path):
+            os.remove(video_path)
 
 
 def send_video(token, chat_id, video_url, caption, moving_preview_url=None, photo_preview_url=None):
@@ -530,6 +579,8 @@ def send_video(token, chat_id, video_url, caption, moving_preview_url=None, phot
         logging.info(f"Sending video by file_id to {chat_id}...")
         try:
             payload = {"chat_id": chat_id, "video": video_url, "caption": caption, "parse_mode": "HTML", "supports_streaming": True}
+            if photo_preview_url:
+                payload["thumbnail"] = photo_preview_url
             res = _http.post(url, json=payload, timeout=30)
             if res.status_code == 200 and res.json().get("ok"):
                 return video_url
@@ -539,6 +590,62 @@ def send_video(token, chat_id, video_url, caption, moving_preview_url=None, phot
         return None
 
     logging.info(f"Downloading video from: {video_url}")
+
+    # ── HLS stream (.m3u8) — must be downloaded via ffmpeg first ──
+    if isinstance(video_url, str) and '.m3u8' in video_url:
+        temp_hls = f"temp_hls_{int(time.time())}.mp4"
+        try:
+            logging.info(f"HLS stream detected. Downloading via ffmpeg: {video_url}")
+            if not download_hls_stream(video_url, temp_hls):
+                logging.error("HLS download failed.")
+                if photo_preview_url:
+                    return send_photo(token, chat_id, photo_preview_url, caption)
+                return None
+
+            file_size = os.path.getsize(temp_hls)
+            if file_size > MAX_VIDEO_SIZE:
+                logging.warning(f"HLS result too large ({file_size:,} bytes). Using Pyrogram...")
+                # Pass path directly so Pyrogram doesn't re-download
+                result = upload_large_video_with_pyrogram(
+                    video_url, caption, chat_id,
+                    video_path=temp_hls,
+                    photo_preview_url=photo_preview_url
+                )
+                temp_hls = None  # ownership transferred — do NOT delete
+                return result
+
+            # Small enough for Bot API — read into memory then send
+            with open(temp_hls, 'rb') as fh:
+                hls_video_data = fh.read()
+        finally:
+            if temp_hls and os.path.exists(temp_hls):
+                os.remove(temp_hls)
+
+        logging.info(f"Uploading HLS-converted video ({len(hls_video_data):,} bytes) to {chat_id}...")
+        try:
+            files = {'video': ('video.mp4', hls_video_data)}
+            payload = {"chat_id": chat_id, "caption": caption, "parse_mode": "HTML", "supports_streaming": True}
+            if photo_preview_url:
+                try:
+                    tr = _http.get(photo_preview_url, timeout=15)
+                    if tr.status_code == 200:
+                        files['thumbnail'] = ('thumb.jpg', tr.content)
+                except Exception as te:
+                    logging.warning(f"Thumbnail fetch error: {te}")
+            r = _http.post(url, data=payload, files=files, timeout=300)
+            if r.status_code == 200 and r.json().get("ok"):
+                try:
+                    file_id = r.json().get("result", {}).get("video", {}).get("file_id")
+                    logging.info(f"HLS video uploaded. file_id: {file_id}")
+                    return file_id
+                except:
+                    return True
+            logging.warning(f"Telegram error for HLS video: {r.text[:200]}")
+        except Exception as e:
+            logging.error(f"Error uploading HLS video: {e}")
+        return None
+    # ── end HLS block ──
+
     video_data = None
     for attempt in range(3):
         try:
@@ -551,7 +658,7 @@ def send_video(token, chat_id, video_url, caption, moving_preview_url=None, phot
                 content_length = res.headers.get("Content-Length")
                 if content_length and int(content_length) > MAX_VIDEO_SIZE:
                     logging.warning(f"Video too large ({content_length} bytes) for Bot API. Using Pyrogram user account...")
-                    pyrogram_result = upload_large_video_with_pyrogram(video_url, caption, chat_id)
+                    pyrogram_result = upload_large_video_with_pyrogram(video_url, caption, chat_id, photo_preview_url=photo_preview_url)
                     if pyrogram_result:
                         return pyrogram_result
                     logging.warning(f"Pyrogram upload failed. Trying moving preview.")
@@ -571,7 +678,7 @@ def send_video(token, chat_id, video_url, caption, moving_preview_url=None, phot
 
                 if downloaded > MAX_VIDEO_SIZE:
                     logging.warning(f"Video exceeded limit during download. Using Pyrogram user account...")
-                    pyrogram_result = upload_large_video_with_pyrogram(video_url, caption, chat_id)
+                    pyrogram_result = upload_large_video_with_pyrogram(video_url, caption, chat_id, photo_preview_url=photo_preview_url)
                     if pyrogram_result:
                         return pyrogram_result
                     logging.warning(f"Pyrogram upload failed. Trying preview.")
@@ -595,6 +702,19 @@ def send_video(token, chat_id, video_url, caption, moving_preview_url=None, phot
     try:
         files = {'video': ('video.mp4', video_data)}
         payload = {"chat_id": chat_id, "caption": caption, "parse_mode": "HTML", "supports_streaming": True}
+
+        # Attach thumbnail so mobile clients show a proper preview instead of a black frame
+        if photo_preview_url:
+            try:
+                thumb_res = _http.get(photo_preview_url, timeout=15)
+                if thumb_res.status_code == 200:
+                    files['thumbnail'] = ('thumb.jpg', thumb_res.content)
+                    logging.info("Thumbnail attached to video upload.")
+                else:
+                    logging.warning(f"Could not fetch thumbnail ({thumb_res.status_code}), skipping.")
+            except Exception as thumb_err:
+                logging.warning(f"Error fetching thumbnail: {thumb_err}")
+
         r = _http.post(url, data=payload, files=files, timeout=300)
         if r.status_code == 200 and r.json().get("ok"):
             res_json = r.json()
@@ -612,6 +732,51 @@ def send_video(token, chat_id, video_url, caption, moving_preview_url=None, phot
 
 
 # ================= MEDIA PARSER =================
+
+
+def get_redgifs_direct_url(page_url):
+    """Fetch the real direct MP4 URL from Redgifs API v2 (no watermark).
+    
+    Redgifs embeds a watermark when you use the watch-page URL directly.
+    This function calls the API to get the actual source file.
+    """
+    try:
+        # Extract gif ID from URLs like:
+        #   https://www.redgifs.com/watch/somegifid
+        #   https://redgifs.com/watch/SomeGifId-extra
+        gif_id = page_url.rstrip('/').split('/')[-1].split('-')[0].lower()
+        if not gif_id:
+            logging.warning("Redgifs: could not extract gif ID from URL")
+            return None
+
+        # Step 1: get a short-lived anonymous token
+        token_res = _http.get("https://api.redgifs.com/v2/auth/temporary", timeout=10)
+        if token_res.status_code != 200:
+            logging.warning(f"Redgifs: failed to get auth token (HTTP {token_res.status_code})")
+            return None
+        token = token_res.json().get("token")
+        if not token:
+            logging.warning("Redgifs: auth token missing in response")
+            return None
+
+        # Step 2: fetch gif metadata
+        headers = {"Authorization": f"Bearer {token}"}
+        gif_res = _http.get(f"https://api.redgifs.com/v2/gifs/{gif_id}", headers=headers, timeout=10)
+        if gif_res.status_code != 200:
+            logging.warning(f"Redgifs: gif metadata request failed (HTTP {gif_res.status_code})")
+            return None
+
+        urls = gif_res.json().get("gif", {}).get("urls", {})
+        # Prefer HD, fall back to SD
+        direct_url = urls.get("hd") or urls.get("sd")
+        if direct_url:
+            logging.info(f"Redgifs: resolved direct URL → {direct_url}")
+        else:
+            logging.warning(f"Redgifs: no hd/sd URL in response: {urls}")
+        return direct_url
+    except Exception as e:
+        logging.warning(f"Redgifs API error: {e}")
+        return None
 
 def get_media_type_and_url(post):
     data = post['data']
@@ -639,6 +804,10 @@ def get_media_type_and_url(post):
         pass
 
     if domain == 'redgifs.com':
+        direct_url = get_redgifs_direct_url(url)
+        if direct_url:
+            return "video", direct_url, moving_preview, photo_preview
+        # Fallback: try the old thumbnail trick
         try:
             thumb = data.get('secure_media', {}).get('oembed', {}).get('thumbnail_url', '')
             if '-poster.jpg' in thumb:
@@ -646,6 +815,7 @@ def get_media_type_and_url(post):
                 return "video", direct_mp4, moving_preview, photo_preview
         except:
             pass
+        logging.warning(f"Redgifs: all resolution methods failed for {url}")
 
     if is_video:
         try:
