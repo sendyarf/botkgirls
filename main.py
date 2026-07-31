@@ -561,16 +561,27 @@ def upload_large_video_with_pyrogram(video_url, caption, chat_id, video_data=Non
                     supports_streaming=True,
                 )
                 # Attach thumbnail if available so mobile shows a proper preview
+                thumb_path = None
                 if photo_preview_url:
                     import tempfile, urllib.request
                     thumb_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+                    thumb_path = thumb_tmp.name
+                    thumb_tmp.close()
                     try:
-                        urllib.request.urlretrieve(photo_preview_url, thumb_tmp.name)
-                        send_kwargs["thumb"] = thumb_tmp.name
+                        urllib.request.urlretrieve(photo_preview_url, thumb_path)
+                        send_kwargs["thumb"] = thumb_path
                     except Exception as thumb_err:
                         logging.warning(f"Could not fetch thumbnail for Pyrogram: {thumb_err}")
-                msg = await app.send_video(**send_kwargs)
-                return msg.video.file_id if msg.video else True
+
+                try:
+                    msg = await app.send_video(**send_kwargs)
+                    return msg.video.file_id if msg.video else True
+                finally:
+                    if thumb_path and os.path.exists(thumb_path):
+                        try:
+                            os.remove(thumb_path)
+                        except Exception:
+                            pass
 
         return asyncio.run(_upload())
     except Exception as e:
@@ -625,20 +636,21 @@ def send_video(token, chat_id, video_url, caption, moving_preview_url=None, phot
             file_size = os.path.getsize(temp_ytdlp)
             if file_size > MAX_VIDEO_SIZE:
                 logging.warning(f"yt-dlp result too large ({file_size:,} bytes). Using Pyrogram...")
-                result = upload_large_video_with_pyrogram(
+                return upload_large_video_with_pyrogram(
                     video_url, caption, chat_id,
                     video_path=temp_ytdlp,
                     photo_preview_url=photo_preview_url
                 )
-                temp_ytdlp = None  # ownership transferred — do NOT delete
-                return result
 
             # Small enough for Bot API — read into memory then send
             with open(temp_ytdlp, 'rb') as fh:
                 ytdlp_video_data = fh.read()
         finally:
-            if temp_ytdlp and os.path.exists(temp_ytdlp):
-                os.remove(temp_ytdlp)
+            if os.path.exists(temp_ytdlp):
+                try:
+                    os.remove(temp_ytdlp)
+                except Exception as cleanup_err:
+                    logging.warning(f"Failed to remove temp file {temp_ytdlp}: {cleanup_err}")
 
         logging.info(f"Uploading yt-dlp video ({len(ytdlp_video_data):,} bytes) to {chat_id}...")
         try:
