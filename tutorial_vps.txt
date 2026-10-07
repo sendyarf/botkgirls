@@ -1,0 +1,45 @@
+TUTORIAL SETUP KPOPGIRLS-BOT DI VPS (UBUNTU/DEBIAN)
+==================================================
+
+1. PERSIAPAN SISTEM & DEPENDENSI
+-------------------------------
+sudo apt update && sudo apt upgrade -y
+sudo apt install python3 python3-pip git -y
+sudo apt install python3.12-venv -y  (Sesuaikan versi python)
+
+2. INSTALL PM2 (PROCESS MANAGER)
+-------------------------------
+curl -fsSL https://deb.nodesource.com/setup_current.x | sudo -E bash -
+sudo apt install -y nodejs
+sudo npm install -g pm2
+
+3. CLONE & SETUP PROJECT
+-----------------------
+git clone https://github.com/sendyarf/botkgirls.git
+cd botkgirls
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+
+4. KONFIGURASI ENV
+-----------------
+nano .env
+(Paste Bot Token, Groq Key, Subreddit, dll)
+Ctrl+O, Enter, Ctrl+X untuk simpan.
+
+5. JALANKAN BOT DENGAN PM2
+-------------------------
+pm2 start main.py --name "kpop-bot" --interpreter ./venv/bin/python3
+pm2 save
+pm2 startup
+(Jalankan perintah 'sudo env...' yang muncul di terminal)
+
+6. PERINTAH MONITORING
+---------------------
+pm2 logs kpop-bot      (Melihat log aktif)
+pm2 status             (Melihat status bot)
+pm2 restart kpop-bot   (Restart bot)
+pm2 stop kpop-bot      (Matikan sementara)
+
+==================================================
+Tutorial dibuat pada: 2026-04-30
