@@ -380,19 +380,25 @@ def send_gallery(token, chat_id, urls, caption):
     if urls and isinstance(urls, list) and not urls[0].startswith(("http://", "https://")):
         logging.info(f"Sending gallery by file_ids to {chat_id}...")
         try:
-            media_group = []
-            for i, file_id in enumerate(urls):
-                media_item = {"type": "photo", "media": file_id}
-                if i == 0:
-                    media_item["caption"] = caption
-                    media_item["parse_mode"] = "HTML"
-                media_group.append(media_item)
-            
-            payload = {"chat_id": chat_id, "media": json.dumps(media_group)}
-            res = _http.post(url_api, json=payload, timeout=120)
-            if res.status_code == 200 and res.json().get("ok"):
-                return urls
-            logging.warning(f"Failed to send gallery by file_ids. Response: {res.text[:200]}")
+            # Telegram caps one album (media group) at 10 items — chunk
+            # larger galleries so e.g. a 17-image gallery goes out as
+            # 10 + 7 instead of failing with "too many messages".
+            for chunk in [urls[i:i + 10] for i in range(0, len(urls), 10)]:
+                media_group = []
+                for i, file_id in enumerate(chunk):
+                    media_item = {"type": "photo", "media": file_id}
+                    if i == 0:
+                        media_item["caption"] = caption
+                        media_item["parse_mode"] = "HTML"
+                    media_group.append(media_item)
+
+                payload = {"chat_id": chat_id, "media": json.dumps(media_group)}
+                res = _http.post(url_api, json=payload, timeout=120)
+                if res.status_code == 200 and res.json().get("ok"):
+                    continue
+                logging.warning(f"Failed to send gallery chunk by file_ids. Response: {res.text[:200]}")
+                return None
+            return urls
         except Exception as e:
             logging.error(f"Error sending gallery by file_ids: {e}")
         return None
