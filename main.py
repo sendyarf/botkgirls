@@ -271,16 +271,24 @@ def mark_processed(post_id, feed_type, is_ad=False, also_mark_ad=False, media_ur
     _db_conn.commit()
 
 
-def track_send(post_id, feed_type, channel_name):
-    """Diagnostic: track and log sends per post to detect duplicates."""
-    key = f"{post_id}@{feed_type}"
-    count = _send_counts.get(key, 0)
-    _send_counts[key] = count + 1
-    if count > 0:
+def track_send(post_id, feed_type, chat_id):
+    """Guard + diagnostic: returns False if this post was already sent to this chat in this process.
+
+    Keyed by (post_id, feed_type, chat_id) so sending the same post to
+    different channels (e.g. the 'hot' feed has two channels) is NOT
+    flagged as a duplicate — only a repeat send to the SAME channel is,
+    and that repeat is blocked before it goes out.
+    """
+    key = (post_id, feed_type, str(chat_id))
+    if key in _send_counts:
+        _send_counts[key] += 1
         logging.warning(
-            f"DUPLICATE SEND DETECTED: post={post_id}, feed={feed_type}, "
-            f"channel={channel_name}, send_number={count + 1} within this process!"
+            f"DUPLICATE SEND BLOCKED: post={post_id}, feed={feed_type}, "
+            f"chat={chat_id}, attempt={_send_counts[key]} within this process!"
         )
+        return False
+    _send_counts[key] = 1
+    return True
 
 
 def cleanup_old_entries(days=HISTORY_CLEANUP_DAYS):
@@ -896,25 +904,23 @@ def process_feed(feed_type):
         new_posts += 1
 
         for chat_id in chat_ids:
+            if not track_send(post_id, feed_type, chat_id):
+                continue
             logging.info(f"→ SENDING to channel {feed_type}({chat_id}) | post={post_id}")
             if media_type == "photo":
                 res = send_photo(token, chat_id, media_url, caption)
                 if isinstance(res, str):
                     media_url = res
-                track_send(post_id, feed_type, feed_type)
             elif media_type == "video":
                 res = send_video(token, chat_id, media_url, caption, moving_preview, photo_preview)
                 if isinstance(res, str):
                     media_url = res
-                track_send(post_id, feed_type, feed_type)
             elif media_type == "gallery":
                 res = send_gallery(token, chat_id, media_url, caption)
                 if isinstance(res, list) and res:
                     media_url = res
-                track_send(post_id, feed_type, feed_type)
             else:
                 send_message(token, chat_id, f"{caption}\n{media_url}")
-                track_send(post_id, feed_type, feed_type)
             time.sleep(2)
 
         if feed_type == "new" and not is_processed(post_id, "media"):
@@ -930,27 +936,30 @@ def process_feed(feed_type):
 
             if media_type == "photo" and photo_chat_ids:
                 for chat_id in photo_chat_ids:
+                    if not track_send(post_id, "media", chat_id):
+                        continue
                     logging.info(f"→ ROUTING to channel photo({chat_id}) | post={post_id}")
                     res = send_photo(token, chat_id, media_url, caption)
                     if isinstance(res, str):
                         media_url = res
-                    track_send(post_id, "media", "photo")
                     time.sleep(2)
             elif media_type == "gallery" and photo_chat_ids:
                 for chat_id in photo_chat_ids:
+                    if not track_send(post_id, "media", chat_id):
+                        continue
                     logging.info(f"→ ROUTING to channel photo({chat_id}) | post={post_id}")
                     res = send_gallery(token, chat_id, media_url, caption)
                     if isinstance(res, list) and res:
                         media_url = res
-                    track_send(post_id, "media", "photo")
                     time.sleep(2)
             elif media_type == "video" and video_chat_ids:
                 for chat_id in video_chat_ids:
+                    if not track_send(post_id, "media", chat_id):
+                        continue
                     logging.info(f"→ ROUTING to channel video({chat_id}) | post={post_id}")
                     res = send_video(token, chat_id, media_url, caption, moving_preview, photo_preview)
                     if isinstance(res, str):
                         media_url = res
-                    track_send(post_id, "media", "video")
                     time.sleep(2)
 
     if new_posts > 0:
