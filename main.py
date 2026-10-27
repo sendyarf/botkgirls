@@ -638,7 +638,13 @@ def send_video(token, chat_id, video_url, caption, moving_preview_url=None, phot
             if not download_video_ytdlp(video_url, temp_ytdlp):
                 logging.error("yt-dlp download failed.")
                 if photo_preview_url:
-                    return send_photo(token, chat_id, photo_preview_url, caption)
+                    # Fall back to the photo preview, but do NOT return the
+                    # photo file_id: the caller caches a returned file_id as
+                    # a *video* file_id, and reusing a photo file_id as a
+                    # video fails ("can't use file of type Photo as Video").
+                    # Returning None keeps the original video URL so the
+                    # next channel falls back to the photo independently.
+                    send_photo(token, chat_id, photo_preview_url, caption)
                 return None
 
             file_size = os.path.getsize(temp_ytdlp)
@@ -704,7 +710,10 @@ def send_video(token, chat_id, video_url, caption, moving_preview_url=None, phot
                     if moving_preview_url and moving_preview_url != video_url:
                         return send_video(token, chat_id, moving_preview_url, caption)
                     elif photo_preview_url:
-                        return send_photo(token, chat_id, photo_preview_url, caption)
+                        # Photo fallback: send it, but don't return its
+                        # file_id — it would be cached as a video file_id
+                        # and fail on the next channel (Photo as Video).
+                        send_photo(token, chat_id, photo_preview_url, caption)
                     return None
 
                 chunks = []
@@ -724,7 +733,10 @@ def send_video(token, chat_id, video_url, caption, moving_preview_url=None, phot
                     if moving_preview_url and moving_preview_url != video_url:
                         return send_video(token, chat_id, moving_preview_url, caption)
                     elif photo_preview_url:
-                        return send_photo(token, chat_id, photo_preview_url, caption)
+                        # Photo fallback: send it, but don't return its
+                        # file_id — it would be cached as a video file_id
+                        # and fail on the next channel (Photo as Video).
+                        send_photo(token, chat_id, photo_preview_url, caption)
                     return None
 
                 video_data = b"".join(chunks)
