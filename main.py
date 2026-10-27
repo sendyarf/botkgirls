@@ -9,7 +9,6 @@ from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
 import requests
 from dotenv import load_dotenv
-from groq import Groq
 import asyncio
 try:
     asyncio.get_event_loop()
@@ -24,7 +23,6 @@ logging.basicConfig(level=logging.INFO, format=f'%(asctime)s - PID:{PID} - %(lev
 
 # ================= CONFIGURATION =================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 SUBREDDIT = os.getenv("SUBREDDIT", "kpopfap")
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "300"))
 API_ID = int(os.getenv("API_ID", "0"))
@@ -70,9 +68,6 @@ _adapter = HTTPAdapter(
 _http.mount("https://", _adapter)
 _http.mount("http://", _adapter)
 _http.headers.update({"User-Agent": USER_AGENT})
-
-# Groq client instance (reuse, jangan new per AI check)
-_groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 _shutdown_requested = False
 _db_conn = None
@@ -305,36 +300,6 @@ def get_stats():
     """Return row counts for monitoring."""
     row = _db_conn.execute("SELECT feed_type, COUNT(*) FROM processed_posts GROUP BY feed_type").fetchall()
     return {r[0]: r[1] for r in row}
-
-
-# ================= AI FILTER =================
-
-def check_is_ad_with_ai(title):
-    if not _groq_client:
-        return False
-    try:
-        chat_completion = _groq_client.chat.completions.create(
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are a content filter. Respond ONLY with 'YES' or 'NO'. Is this Reddit post title an advertisement, spam, or a community announcement? Title:"
-                },
-                {
-                    "role": "user",
-                    "content": title,
-                }
-            ],
-            model="llama-3.3-70b-versatile",
-        )
-        answer = chat_completion.choices[0].message.content.strip().upper()
-        is_ad = "YES" in answer
-        if is_ad:
-            logging.info(f"AI detected ad/announcement: {title}")
-        time.sleep(1)
-        return is_ad
-    except Exception as e:
-        logging.error(f"Error AI filter: {e}")
-        return False
 
 
 # ================= TELEGRAM SENDERS =================
@@ -894,10 +859,6 @@ def process_feed(feed_type):
             logging.info(f"Skipping known ad in {feed_type}: {post_id}")
             continue
 
-        if check_is_ad_with_ai(title):
-            mark_processed(post_id, feed_type, is_ad=True, also_mark_ad=True)
-            continue
-
         media_type, media_url, moving_preview, photo_preview = get_media_type_and_url(post)
 
         if media_type == "link":
@@ -984,9 +945,6 @@ def main():
     if not BOT_TOKEN:
         logging.error("BOT_TOKEN not set. Please configure .env file.")
         return
-    if not GROQ_API_KEY:
-        logging.warning("GROQ_API_KEY not set. AI ad filtering will be disabled.")
-
     if not _acquire_pid_lock():
         logging.error("Exiting to prevent duplicate instances.")
         sys.exit(1)
